@@ -141,6 +141,7 @@ declares exactly what it can do and the app shows only those features.
 | jring (generic smart ring) | `56ff` | `SMART_RING` | $7–12 |
 | Colmi / Yawell ring family — **QRing app** | `6e40fff0` / `de5bf728` | `R02_…`, `R0x…`, `COLMI R1x…`, `H59_…` | $15–30 |
 | Colmi / Yawell ring family — **SmartHealth app** | `be940` (Yucheng YCBT) | `R99 54DC` and similar | $15–30 |
+| R10M (**LittleMeatball**) | `be940` (Yucheng YCBT) | `R10M …` (e.g. `R10M FCF4`) | $15–30 |
 | TK5 ring — 🧪 **limited support** | `be940` (Yucheng YCBT) | `TK5 …` (e.g. `TK5 24AA`) | ❓ |
 
 > ⚠️ **A Colmi ring ships with *either* the QRing or the SmartHealth app** — two completely different
@@ -148,6 +149,12 @@ declares exactly what it can do and the app shows only those features.
 > pair. Pick the wrong one and it simply won't connect; the app then offers a one-tap "try the other
 > app" retry. Both are supported. See the
 > [Colmi page](https://saksham2001.github.io/PulseLoopiOS/hardware/colmi/#smarthealth-app-colmi-rings).
+>
+> ✅ **The R10M is the best-tested YCBT ring.** It speaks the same protocol as the SmartHealth-app
+> Colmi rings and the TK5, but it is a different vendor's ring, so it pairs on its own — no app-type
+> question — and carries its own capability set. Pairing, sync, HR/SpO₂/BP, battery and sleep are all
+> validated on firmware 2.32. See the
+> [R10M page](https://saksham2001.github.io/PulseLoopiOS/hardware/r10m/).
 >
 > 🧪 **The TK5 is still experimental.** It shares its driver with the SmartHealth-app Colmi rings, and
 > that driver is confirmed working on one — but no TK5 has run it, and a few value scales still need a

@@ -124,7 +124,15 @@ final class TK5Coordinator: WearableCoordinator {
 
     let iconSystemName = "circle.circle.fill"
 
+    /// Both firmware flags stay `true`: the TK5 answers `02 1b` GetChipScheme without dropping the link,
+    /// and the R99 session showed a YCBT ring NAKing the all-day BP monitor harmlessly rather than
+    /// needing it suppressed. Only the R10M turns either off.
     func makeDriver(writer: RingCommandWriter) -> WearableDriver {
-        YCBTDriver(writer: writer)
+        YCBTDriver(writer: writer, profile: YCBTFamilyProfile(
+            baselineCapabilities: capabilities,
+            bitmapGatedCapabilities: bitmapGatedCapabilities,
+            queryChipSchemeAtStartup: true,
+            supportsBloodPressureMonitor: true
+        ))
     }
 }

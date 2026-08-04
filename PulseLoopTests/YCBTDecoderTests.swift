@@ -72,6 +72,22 @@ final class YCBTDecoderTests: XCTestCase {
         XCTAssertEqual(calories, 26)      // 0x001a (capture-inferred)
     }
 
+    /// All three fields or none. `YCBTBytes.u16` returns 0 past the end of the buffer, so a truncated
+    /// `06 00` used to decode as a *valid* activity row with zeroed distance and calories — the ratchet
+    /// keeps the totals safe, but the row itself asserts a zero the ring never reported.
+    func testShortLiveStatusFrameEmitsNoActivityRow() {
+        // 06 00 with only the step field — 2 payload bytes where the layout needs 6.
+        let frame = YCBTFrame(validating: YCBTFrame.frame([0x06, 0x00, 0x7b, 0x02]))!
+        let events = decoder.decode(frame)
+        XCTAssertFalse(
+            events.contains { if case .activityUpdate = $0 { return true } else { return false } },
+            "a short frame must not publish a half-read activity row, got \(events)"
+        )
+        guard case .commandAck = events.first else {
+            return XCTFail("expected a bare ack, got \(events)")
+        }
+    }
+
     /// `06 03` is one fixed layout (`unpackRealBloodData`), not two shapes: `[SBP][DBP][hr][hrv][spo2]`
     /// `[tempInt][tempFrac]`. The old "BP-vs-HRV heuristic" was reading exactly these offsets without
     /// knowing it — in BP mode the ring fills @0/@1 and zeroes @3, in HRV mode the reverse — so both
@@ -418,6 +434,41 @@ final class YCBTDecoderTests: XCTestCase {
         XCTAssertEqual(decoded.timeIntervalSince1970, date.timeIntervalSince1970, accuracy: 1)
     }
 
+    /// The offset must be resolved at the **timestamp's own date**, not today's. A ring record written in
+    /// January and read back in July is stamped with a wall-clock the ring never converted, so applying
+    /// July's offset to it shifts the whole record by an hour — enough to move a late-evening sample into
+    /// the wrong day, and every sleep stage into the wrong hour bucket.
+    func testDateDecodeUsesTheOffsetInForceAtTheRecordsOwnDate() {
+        let tz = TimeZone(identifier: "America/New_York")!   // EST (-5) in January, EDT (-4) in July
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = TimeZone(identifier: "UTC")!
+
+        // The ring stored "2026-01-15 22:30:00" as naive local wall-clock.
+        let stored = DateComponents(year: 2026, month: 1, day: 15, hour: 22, minute: 30)
+        guard let naive = utc.date(from: stored) else { return XCTFail("fixture") }
+        let ringSeconds = Int(naive.timeIntervalSince1970 - YCBTBytes.epochOffset)
+
+        let decoded = YCBTBytes.date(ringSeconds, timeZone: tz)
+
+        // Read back as local components it must still say 22:30 on the 15th — whatever today's offset is.
+        var local = Calendar(identifier: .gregorian)
+        local.timeZone = tz
+        let parts = local.dateComponents([.year, .month, .day, .hour, .minute], from: decoded)
+        XCTAssertEqual(parts.year, 2026)
+        XCTAssertEqual(parts.month, 1)
+        XCTAssertEqual(parts.day, 15)
+        XCTAssertEqual(parts.hour, 22)
+        XCTAssertEqual(parts.minute, 30)
+
+        // Concretely: EST is -5, so the true instant is 03:30 UTC on the 16th. Using July's -4 would put
+        // it at 02:30 — the hour of drift this test exists to catch.
+        XCTAssertEqual(
+            decoded.timeIntervalSince1970,
+            naive.timeIntervalSince1970 + 5 * 3600,
+            accuracy: 1
+        )
+    }
+
     /// Sleep segment durations are u24; a u16 read truncates anything over 18h12m.
     func testU24ReadsThreeBytesLittleEndian() {
         XCTAssertEqual(YCBTBytes.u24([0x40, 0x19, 0x01], 0), 72_000)
@@ -431,7 +482,7 @@ final class YCBTDecoderTests: XCTestCase {
 
     @MainActor
     private func makeDriver() -> YCBTDriver {
-        YCBTDriver(writer: SilentRingWriter())
+        YCBTDriver(writer: SilentRingWriter(), profile: .permissiveTestProfile)
     }
 }
 

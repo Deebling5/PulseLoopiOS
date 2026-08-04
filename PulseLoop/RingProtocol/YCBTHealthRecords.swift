@@ -105,8 +105,12 @@ enum YCBTHealthRecords {
         var events: [RingDecodedEvent] = []
         for r in records(in: buffer, size: 20) {
             let ts = YCBTBytes.date(YCBTBytes.u32(r, 0))
-            events.append(.activityUpdate(timestamp: ts, steps: YCBTBytes.u16(r, 4),
-                                          distanceMeters: 0, calories: 0))
+            // Steps (`u16` @4) are deliberately **not** emitted. The field is the ring's *cumulative*
+            // day counter as of this record, and `.activityUpdate` is a per-day max ratchet — so the
+            // oldest record in a dump that spans midnight sets today's total to yesterday's count and
+            // nothing can lower it again for the rest of the day. Activity has two sources that don't
+            // have this problem: the `05 02` sport buckets (additive intervals) and the `06 00` live
+            // status (the counter, always current).
             events.append(contentsOf: bloodPressureEvents(systolic: r[7], diastolic: r[8], timestamp: ts))
             if r[9] > 0 {
                 events.append(.historyMeasurement(kind: .spo2, value: Double(r[9]), timestamp: ts))
@@ -249,8 +253,15 @@ enum YCBTHealthRecords {
                 guard seenStarts.insert(segmentStart).inserted else { continue } // firmware repeat — count once
                 let segmentSeconds = YCBTBytes.u24(buffer, offset + 5)
                 if sessionStart == nil { sessionStart = YCBTBytes.date(segmentStart) }
+                // The timeline is expanded positionally — one entry per minute from the session start —
+                // so a bogus duration doesn't just mis-size one stage, it allocates. The field is u24:
+                // an all-ones segment is 194 days, or ~280 000 array entries for a single 8-byte record,
+                // and a buffer of them exhausts memory before anything gets a chance to reject it. No
+                // real session exceeds a day, so cap there and stop.
+                let remaining = Self.maxSleepSessionMinutes - stages.count
+                if remaining <= 0 { break }
                 let minutes = Int((Double(segmentSeconds) / 60.0).rounded())
-                stages.append(contentsOf: Array(repeating: stage, count: max(1, minutes)))
+                stages.append(contentsOf: Array(repeating: stage, count: min(max(1, minutes), remaining)))
             }
 
             if let start = sessionStart, !stages.isEmpty {
@@ -291,6 +302,9 @@ enum YCBTHealthRecords {
     /// The ring's "no temperature sample" fraction marker. SmartHealth's own chart drops on it
     /// **independently of the integer part** (`TemperatureActivity`: `int <= 42 && int >= 33 && frac != 15`),
     /// so it is a sentinel, not a fraction that happens to be 15.
+    /// Ceiling on one decoded sleep session, in minutes. See the sleep segment loop.
+    static let maxSleepSessionMinutes = 24 * 60
+
     private static let temperatureFiller: UInt8 = 15
 
     /// Temperature from an int/fraction pair, shared by the dedicated record and the All record.

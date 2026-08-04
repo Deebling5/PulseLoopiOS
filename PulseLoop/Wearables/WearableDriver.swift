@@ -58,6 +58,25 @@ protocol WearableDriver: AnyObject {
     /// must be stopped here. Default: no-op.
     func connectionDidEnd()
 
+    /// Notify characteristics that must **all** be subscribed before the connection counts as up.
+    ///
+    /// A driver that leaves this empty gets the historical behaviour: `.connected` fires — and with it
+    /// the startup handshake — on whichever notify characteristic reports `isNotifying` first. That is
+    /// fine for a device whose channels are interchangeable, and wrong for one that splits its protocol
+    /// across them: YCBT puts every command *reply* on `be940001` and the live/history stream on
+    /// `be940003`, so a handshake begun after only one is live loses whichever half was still pending —
+    /// silently, because a missing reply is indistinguishable from a slow one.
+    ///
+    /// These must be a subset of `notifyUUIDs`; anything else can never be satisfied.
+    var requiredSubscriptionsBeforeConnected: [CBUUID] { get }
+
+    /// Logical commands to write the moment those subscriptions complete, **ahead of** the sync engine's
+    /// startup sequence. For a vendor handshake that has to lead — a clock write whose ordering changes
+    /// how subsequent records are stamped, say — queueing it in `runStartup` is too late: the engine's
+    /// commands are appended to a queue that may already hold battery reads and optional CCCD work.
+    /// Default: none.
+    func immediatePostSubscriptionCommands() -> [Data]
+
     /// The stateful brain: startup sequence + (for Colmi) the response-driven history machine.
     func makeSyncEngine() -> RingSyncEngine
 }
@@ -68,6 +87,10 @@ extension WearableDriver {
     func usesCommandChannel(for frame: Data) -> Bool { false }
     func connectionDidStart() {}
     func connectionDidEnd() {}
+    /// Empty keeps the historical behaviour: the connection is up as soon as *any* notify characteristic
+    /// starts notifying.
+    var requiredSubscriptionsBeforeConnected: [CBUUID] { [] }
+    func immediatePostSubscriptionCommands() -> [Data] { [] }
 }
 
 /// User-chosen all-day measurement configuration, passed as a plain value from the app layer into a

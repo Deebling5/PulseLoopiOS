@@ -1,6 +1,7 @@
 import SwiftUI
 import SwiftData
 import UIKit
+import OSLog
 
 struct RootAppView: View {
     @Environment(\.modelContext) private var modelContext
@@ -40,6 +41,50 @@ struct RootAppView: View {
                 if UserDefaults.standard.bool(forKey: "seedDemo") {
                     SeedData.clearAll(modelContext)
                     SeedData.seedDemo(modelContext, completeOnboarding: true)
+                }
+                // Test tooling: fake a connected Strava account. Must run before anything touches
+                // StravaAuthService.shared (it reads the token store at init).
+                if UserDefaults.standard.bool(forKey: "demoStravaConnected") {
+                    StravaDemoState.apply()
+                }
+                #if DEBUG
+                // Test tooling: headless full-archive export/import against
+                // Documents/pulseloop-export.json, so the simulator smoke test can drive the
+                // feature without the share sheet / file picker.
+                let archiveLog = Logger(subsystem: "xyz.sakshambhutani.pulseloop2", category: "DataArchive")
+                if UserDefaults.standard.bool(forKey: "exportDataToDocuments"),
+                   let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+                    let url = docs.appendingPathComponent("pulseloop-export.json")
+                    do {
+                        let data = try await DataArchiveService.exportArchive(context: modelContext)
+                        try data.write(to: url, options: .atomic)
+                        archiveLog.info("exported \(data.count) bytes to \(url.path)")
+                    } catch {
+                        archiveLog.error("export failed — \(error)")
+                    }
+                }
+                if UserDefaults.standard.bool(forKey: "importDataFromDocuments"),
+                   let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+                    let url = docs.appendingPathComponent("pulseloop-export.json")
+                    do {
+                        let data = try Data(contentsOf: url)
+                        try await DataArchiveService.importArchive(data, context: modelContext)
+                        archiveLog.info("import from \(url.path) succeeded")
+                    } catch {
+                        archiveLog.error("import failed — \(error)")
+                    }
+                }
+                #endif
+                // Test tooling: flip the (off-by-default) nutrition feature on via launch arg.
+                if UserDefaults.standard.bool(forKey: "enableNutrition") {
+                    NutritionPrefsStore.shared.prefs.masterEnabled = true
+                    PulseDataChange.shared.notify()
+                }
+                if UserDefaults.standard.bool(forKey: "openNutrition") {
+                    path.append(AppRoute.nutrition)
+                }
+                if UserDefaults.standard.bool(forKey: "openNutritionSettings") {
+                    path.append(AppRoute.settingsNutrition)
                 }
                 // Test tooling: deep-link straight to a seeded workout's detail (route map).
                 if UserDefaults.standard.bool(forKey: "openWorkout"),
@@ -102,16 +147,26 @@ struct RootAppView: View {
                     GoalsSettingsView()
                 case .settingsVitals:
                     VitalsSettingsView()
+                case .settingsHeartRateZones:
+                    HeartRateZoneSettingsView()
                 case .settingsToday:
                     TodaySettingsView()
                 case .settingsCalibration:
                     CalibrationSettingsView()
                 case .settingsHealth:
                     AppleHealthSettingsView()
+                case .settingsStrava:
+                    StravaSettingsView()
                 case .settingsPrivacyData:
                     PrivacyDataSettingsView()
                 case .settingsAbout:
                     AboutSettingsView(path: $path)
+                case .settingsNutrition:
+                    NutritionSettingsView()
+                case .nutrition:
+                    NutritionView(path: $path)
+                case let .mealDetail(id):
+                    MealDetailView(mealId: id, path: $path)
                 case .pairing:
                     PairingView(onConnected: { path.removeLast() })
                 case .debug:
@@ -179,11 +234,11 @@ struct MainTabView: View {
         }
     }
 
-    /// A workout card tapped inside the chat can't push onto `path` directly: the sheet
+    /// A card tapped inside the chat can't push onto `path` directly: the sheet
     /// sits outside this NavigationStack, so the detail would slide in behind it. Park
     /// the route and dismiss; `pushPendingCoachRoute` runs once the sheet is gone.
-    private func requestCoachRoute(_ activityId: UUID) {
-        pendingCoachRoute = .activityDetail(activityId)
+    private func requestCoachRoute(_ route: AppRoute) {
+        pendingCoachRoute = route
         nav.showCoach = false
     }
 
@@ -266,7 +321,10 @@ struct MainTabView: View {
         // Coach opens as a sheet (swipe-to-dismiss) instead of a tab, so it never
         // crowds the tab bar. All entry points set `nav.showCoach`.
         .sheet(isPresented: $nav.showCoach, onDismiss: pushPendingCoachRoute) {
-            CoachView(onOpenWorkout: requestCoachRoute)
+            CoachView(
+                onOpenWorkout: { requestCoachRoute(.activityDetail($0)) },
+                onOpenMeal: { requestCoachRoute(.mealDetail($0)) }
+            )
                 .presentationDragIndicator(.visible) // grabber ("pull tab") at the top of the sheet
         }
         .background(PulseColors.background.ignoresSafeArea())

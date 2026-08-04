@@ -45,12 +45,15 @@ final class YCBTHealthRecordsTests: XCTestCase {
         XCTAssertEqual(values(.bloodPressureDiastolic, in: events).last, 70)
         XCTAssertFalse(events.contains { if case .bloodPressureSample = $0 { return true } else { return false } })
 
-        // Steps are the ring's cumulative daily counter, so they ride `.activityUpdate` (per-day max),
-        // not an additive bucket. First record = the 23:00 daily total.
-        let steps = events.compactMap { event -> Int? in
-            if case let .activityUpdate(_, value, _, _) = event { return value } else { return nil }
-        }
-        XCTAssertEqual(steps.max(), 3336)
+        // Steps (@4) are deliberately **not** emitted. The field is the ring's cumulative day counter as
+        // of each record, and `.activityUpdate` is a per-day max ratchet — so the oldest record in a dump
+        // that spans midnight sets today's total to yesterday's count, and nothing can lower it again for
+        // the rest of the day. The `05 02` sport buckets and the live `06 00` counter are the sources
+        // that don't have this problem.
+        XCTAssertFalse(
+            events.contains { if case .activityUpdate = $0 { return true } else { return false } },
+            "the combined record must not publish its stale cumulative step counter"
+        )
     }
 
     /// Respiratory rate (@10) was decoded but silently dropped before A3.
@@ -77,14 +80,12 @@ final class YCBTHealthRecordsTests: XCTestCase {
         XCTAssertEqual(MeasurementKind.bloodSugar.unit, "mg/dL")
     }
 
-    /// An unworn record (SpO₂ out of range, HRV 0, BP 0) still carries the day's step count — and
-    /// nothing else.
-    func testUnwornCombinedVitalsRecordYieldsStepsOnly() {
+    /// An unworn record (SpO₂ out of range, HRV 0, BP 0) carries nothing but the day's step count, and
+    /// that counter is no longer published from here — so the record decodes to nothing at all rather
+    /// than to a row asserting a measurement the ring never took.
+    func testUnwornCombinedVitalsRecordYieldsNothing() {
         let events = YCBTHealthRecords.combinedVitals(bytes("1cf0de31080d4700000000000000000000000000"))
-        XCTAssertEqual(events.count, 1)
-        guard case .activityUpdate = events.first else {
-            return XCTFail("expected a lone activityUpdate, got \(events)")
-        }
+        XCTAssertTrue(events.isEmpty, "expected no events, got \(events)")
     }
 
     /// Records are sliced from the whole buffer, so a trailing partial record is dropped rather than
@@ -288,6 +289,39 @@ final class YCBTHealthRecordsTests: XCTestCase {
         XCTAssertEqual(timestamps(in: events).first, YCBTBytes.date(836_694_044))
     }
 
+    // MARK: Hostile input
+
+    /// Segment durations are u24, so an all-ones field is 194 days. The timeline is expanded
+    /// *positionally* — one entry per minute from the session start — so a bogus duration doesn't
+    /// mis-size one stage, it allocates ~280 000 array entries for a single 8-byte record, and a buffer
+    /// of them exhausts memory before anything gets a chance to reject the reading.
+    func testSleepSegmentDurationIsClampedToOneDay() {
+        // header: recordLength 28 (20 header + 1 segment), then one DEEP segment of 0xFFFFFF seconds.
+        let record = bytes("00001c00" + "1cf0de31" + "a0f3de31" + "0000000000000000")
+            + bytes("02" + "1cf0de31" + "ffffff")
+        let events = YCBTHealthRecords.sleep(record)
+
+        guard case let .sleepTimeline(_, stages) = events.first else {
+            return XCTFail("expected a sleep timeline, got \(events)")
+        }
+        XCTAssertEqual(stages.count, YCBTHealthRecords.maxSleepSessionMinutes)
+        XCTAssertEqual(stages.count, 24 * 60)
+    }
+
+    /// A real night is nowhere near the cap, so the clamp must not touch it.
+    func testRealisticSleepSegmentsAreNotClamped() {
+        // Two segments: 30 min deep, 45 min light.
+        let record = bytes("00002400" + "1cf0de31" + "a0f3de31" + "0000000000000000")
+            + bytes("01" + "1cf0de31" + "080700")     // tag 1 = deep, 1800 s
+            + bytes("02" + "44fdde31" + "8c0a00")     // tag 2 = light, 2700 s
+        guard case let .sleepTimeline(_, stages) = YCBTHealthRecords.sleep(record).first else {
+            return XCTFail("expected a sleep timeline")
+        }
+        XCTAssertEqual(stages.count, 75)
+        XCTAssertEqual(stages.filter { $0 == .deep }.count, 30)
+        XCTAssertEqual(stages.filter { $0 == .light }.count, 45)
+    }
+
     // MARK: Type table → decoder wiring
 
     /// `decode(_:type:)` is what the transfer machine actually calls; every catalog type must reach a
@@ -304,9 +338,9 @@ final class YCBTHealthRecordsTests: XCTestCase {
         XCTAssertEqual(YCBTHealthRecords.decode(temperature, type: .temperature).count, 2)
         // hrv + stress + fatigue + vo2max
         XCTAssertEqual(YCBTHealthRecords.decode(capturedBodyRecord, type: .bodyData).count, 4)
-        // 8 records × (steps + systolic + diastolic + spo2 + respiratory rate + hrv); temp and blood
-        // sugar are the unmeasured fillers in this capture.
-        XCTAssertEqual(YCBTHealthRecords.decode(capturedAllRecords, type: .all).count, 8 * 6)
+        // 8 records × (systolic + diastolic + spo2 + respiratory rate + hrv); temp and blood sugar are
+        // the unmeasured fillers in this capture, and the cumulative step counter is not published.
+        XCTAssertEqual(YCBTHealthRecords.decode(capturedAllRecords, type: .all).count, 8 * 5)
         XCTAssertFalse(YCBTHealthRecords.decode(capturedNight, type: .sleep).isEmpty)
         XCTAssertFalse(YCBTHealthRecords.decode(capturedHeartRecords, type: .heart).isEmpty)
     }

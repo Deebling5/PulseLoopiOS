@@ -17,8 +17,27 @@ struct YCBTEncoder {
         settings.setTime(date, calendar: calendar)
     }
 
-    /// The connect handshake, in the SmartHealth app's own order: clock → device interrogation →
-    /// locale → all-day monitors → user profile → live-status stream.
+    /// The two commands that go out the *instant* both indication channels are live, ahead of everything
+    /// `startupSequence` queues — `RingBLEClient` prepends them via
+    /// `WearableDriver.immediatePostSubscriptionCommands()`.
+    ///
+    /// They lead for different reasons. `02 03` GetDeviceName is the cheapest possible round-trip that
+    /// proves the ring is answering on `be940001` at all, so a topology that came up half-subscribed
+    /// fails here rather than silently swallowing the whole handshake. `01 00` SetTime leads because
+    /// every record the ring stores is stamped from its own RTC in local wall-clock: a clock set *after*
+    /// the history walk has begun mis-stamps everything read before it.
+    func postSubscriptionHandshake(_ date: Date = Date(), calendar: Calendar = .current) -> [[UInt8]] {
+        [deviceNameRequest(), setTime(date, calendar: calendar)]
+    }
+
+    /// Read the ring's stored name (`02 03`).
+    func deviceNameRequest() -> [UInt8] {
+        logical(YCBTGroup.get, YCBTCommand.getDeviceName, [0x47, 0x50])
+    }
+
+    /// The connect handshake, in the SmartHealth app's own order: device interrogation → locale →
+    /// all-day monitors → user profile → live-status stream. The clock and the name request run ahead of
+    /// this, in `postSubscriptionHandshake`.
     ///
     /// **Never add these to it** — each was once here, and each was a different kind of wrong:
     ///   • **No `05 xx`.** The Health group is the *history* protocol: `YCBTHistoryTransfer` owns those
@@ -29,33 +48,71 @@ struct YCBTEncoder {
     ///     legitimate `04` write is an ACK for a push it received (`YCBTDriver.acknowledgePush`) — the
     ///     `04 0e 00` seen in a capture was SmartHealth ACKing a `MeasurementResult`, not a handshake
     ///     step, and replaying it unprompted does nothing.
+    ///
+    /// - Parameters:
+    ///   - capabilities: what this ring is currently believed to have. Filters the monitor writes so a
+    ///     ring is never asked to run a sensor it doesn't declare.
+    ///   - queryChipScheme: `false` suppresses the informational `02 1b`. The R10M closes an otherwise
+    ///     healthy link with HCI `0x13` on that query; the TK5 and SmartHealth-Colmi answer it fine.
+    ///   - supportsBloodPressureMonitor: `false` suppresses the all-day BP monitor `01 1c` outright,
+    ///     regardless of the `.bloodPressure` capability — the R10M has the sensor but not the monitor.
     func startupSequence(
         date: Date = Date(),
         measurement: MeasurementSettings = .allOnDefault,
         profile: UserProfileValues = UserProfileValues(metric: true, sex: nil, age: nil, heightCm: nil, weightKg: nil),
         languageCode: UInt8 = 0,
-        is24Hour: Bool = true
+        is24Hour: Bool = true,
+        capabilities: Set<WearableCapability> = Set(WearableCapability.allCases),
+        queryChipScheme: Bool = true,
+        supportsBloodPressureMonitor: Bool = true
     ) -> [[UInt8]] {
         var seq: [[UInt8]] = []
-        seq.append(setTime(date))
         // Device interrogation. The 2-byte tags are cosmetic (the firmware ignores the payload of a Get)
         // but we keep the app's exact bytes: they cost nothing and keep a byte-diff against a capture clean.
         seq.append(logical(YCBTGroup.get, YCBTCommand.getDeviceInfo, [0x47, 0x43]))
         seq.append(logical(YCBTGroup.get, YCBTCommand.getSupportFunction, [0x47, 0x46]))
-        seq.append(logical(YCBTGroup.get, YCBTCommand.getChipScheme, []))
-        seq.append(logical(YCBTGroup.get, YCBTCommand.getDeviceName, [0x47, 0x50]))
+        if queryChipScheme {
+            seq.append(logical(YCBTGroup.get, YCBTCommand.getChipScheme, []))
+        }
         seq.append(logical(YCBTGroup.get, YCBTCommand.getUserConfig, [0x43, 0x46]))
         seq.append(settings.language(languageCode))
         seq.append(settings.units(metric: profile.metric, is24Hour: is24Hour))
-        seq.append(contentsOf: settings.monitorCommands(measurement))
+        seq.append(contentsOf: monitorCommands(
+            measurement,
+            capabilities: capabilities,
+            supportsBloodPressureMonitor: supportsBloodPressureMonitor
+        ))
         seq.append(settings.userInfo(profile))
         seq.append(enableLiveStatus())
         return seq
     }
 
     /// Re-push the all-day monitors without the rest of the handshake (the live "Save" path).
-    func monitorCommands(_ measurement: MeasurementSettings) -> [[UInt8]] {
-        settings.monitorCommands(measurement)
+    ///
+    /// Filtered by capability on the way out: each `01 xx {enable, interval}` write names one sensor, and
+    /// a ring that lacks it answers `0xFC`. Sending it anyway is not merely noise — it puts a rejection
+    /// in the middle of the handshake for something the user can't fix, and on the R10M the all-day BP
+    /// monitor is unimplemented even though the BP *sensor* is present (hence the separate flag).
+    ///
+    /// A capability we can't map to a monitor byte drops the command rather than passing it through: the
+    /// default `capabilities` is the full set, so an unfiltered caller still gets all five.
+    func monitorCommands(
+        _ measurement: MeasurementSettings,
+        capabilities: Set<WearableCapability> = Set(WearableCapability.allCases),
+        supportsBloodPressureMonitor: Bool = true
+    ) -> [[UInt8]] {
+        settings.monitorCommands(measurement).filter { command in
+            guard command.count >= 2 else { return false }
+            switch command[1] {
+            case YCBTSettingKey.heartMonitor: return capabilities.contains(.heartRate)
+            case YCBTSettingKey.bloodPressureMonitor:
+                return supportsBloodPressureMonitor && capabilities.contains(.bloodPressure)
+            case YCBTSettingKey.temperatureMonitor: return capabilities.contains(.temperature)
+            case YCBTSettingKey.bloodOxygenMonitor: return capabilities.contains(.spo2)
+            case YCBTSettingKey.hrvMonitor: return capabilities.contains(.hrv)
+            default: return false
+            }
+        }
     }
 
     /// Push the user's real height/weight/sex/age (`01 03`).

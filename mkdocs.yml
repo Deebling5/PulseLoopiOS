@@ -110,7 +110,9 @@ nav:
       - Overview: hardware/index.md
       - Jring / 56ff: hardware/jring.md
       - Colmi / Yawell (QRing + SmartHealth): hardware/colmi.md
+      - R10M / LittleMeatball: hardware/r10m.md
       - TK5 / SmartHealth: hardware/tk5.md
+      - LuckRing / TK18: hardware/luckring.md
       - SIMSONLAB: hardware/simsonlab.md
       - Premium Rings: hardware/premium.md
   - Platforms:

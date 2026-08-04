@@ -455,19 +455,28 @@ final class EventPersistenceSubscriber {
         // `Calendar.wakingDay(forSleepStart:)`.
         let dateKey = calendar.wakingDay(forSleepStart: start)
 
+        // Attach this packet's per-minute blocks to the day's container session (create one if the
+        // day is empty), deduping by block start across every session on the day. Then hand off to
+        // `SleepService.reconcileWakingDay`, which re-splits the day's blocks into distinct sessions
+        // (main night vs. naps separated by a >= 60 min gap) and recomputes each session's bounds.
         let allSessions = (try? context.fetch(FetchDescriptor<SleepSession>())) ?? []
-        let session = allSessions.first { calendar.isDate($0.date, inSameDayAs: dateKey) }
+        let daySessions = allSessions.filter { calendar.isDate($0.date, inSameDayAs: dateKey) }
+        let container = daySessions.min { $0.startAt < $1.startAt }
             ?? {
                 let new = SleepSession(date: dateKey, startAt: start, endAt: start, totalMinutes: 0, syncedAt: Date())
                 context.insert(new)
                 return new
             }()
 
-        func blocks(for sessionId: UUID) -> [SleepStageBlock] {
-            ((try? context.fetch(FetchDescriptor<SleepStageBlock>())) ?? []).filter { $0.sessionId == sessionId }
-        }
+        // Rows to hand `reconcileWakingDay` (a just-created container isn't in `daySessions` yet).
+        let sessionsForDay = daySessions.contains(where: { $0.id == container.id }) ? daySessions : daySessions + [container]
 
-        var existingStarts = Set(blocks(for: session.id).map { $0.startAt })
+        let daySessionIds = Set(sessionsForDay.map { $0.id })
+        let existingDayBlocks = ((try? context.fetch(FetchDescriptor<SleepStageBlock>())) ?? [])
+            .filter { daySessionIds.contains($0.sessionId) }
+        var existingStarts = Set(existingDayBlocks.map { $0.startAt })
+        var newBlocks: [SleepStageBlock] = []
+
         var offset = 0
         while offset < stages.count {
             let stage = stages[offset]
@@ -477,26 +486,18 @@ final class EventPersistenceSubscriber {
             }
             let blockStart = calendar.date(byAdding: .minute, value: offset, to: start) ?? start
             if !existingStarts.contains(blockStart) {
-                context.insert(SleepStageBlock(sessionId: session.id, startAt: blockStart, startMinute: 0, durationMinutes: duration, stage: stage))
+                let block = SleepStageBlock(sessionId: container.id, startAt: blockStart, startMinute: 0, durationMinutes: duration, stage: stage)
+                context.insert(block)
+                newBlocks.append(block)
                 existingStarts.insert(blockStart)
             }
             offset += duration
         }
 
-        let sorted = blocks(for: session.id).sorted { $0.startAt < $1.startAt }
-        guard let first = sorted.first else { return }
-        let sessionStart = first.startAt
-        let sessionEnd = sorted
-            .map { calendar.date(byAdding: .minute, value: $0.durationMinutes, to: $0.startAt) ?? $0.startAt }
-            .max() ?? sessionStart
-        for block in sorted {
-            block.startMinute = max(0, Int(block.startAt.timeIntervalSince(sessionStart) / 60))
-        }
-        session.startAt = sessionStart
-        session.endAt = sessionEnd
-        session.totalMinutes = max(0, Int(sessionEnd.timeIntervalSince(sessionStart) / 60))
-        session.syncedAt = Date()
-        session.updatedAt = Date()
-        context.insert(DerivedUpdateRow(kind: "sleep_timeline", entityType: "sleep_session", entityId: session.id.uuidString))
+        // Hand the in-memory rows + blocks (incl. the ones just inserted, unsaved under the
+        // coalesced flush) straight to reconcile so it needn't re-scan the whole store.
+        SleepService.reconcileWakingDay(dateKey: dateKey, context: context,
+                                        daySessions: sessionsForDay,
+                                        dayBlocks: existingDayBlocks + newBlocks)
     }
 }

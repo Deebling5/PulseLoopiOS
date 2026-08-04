@@ -53,3 +53,5 @@ site/
 *~
 CLAUDE.md
 AGENT.md
+# Strava API credentials (developer-local, see StravaSecrets.swift)
+PulseLoop/Integrations/Strava/StravaSecrets.plist

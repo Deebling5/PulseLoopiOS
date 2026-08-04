@@ -36,7 +36,16 @@ enum SeedData {
             baselineCompleted: false
         )
         context.insert(profile)
-        context.insert(UserGoal(steps: 10000, sleepMinutes: 480, activeMinutes: 45, workoutsPerWeek: 4))
+        let goal = UserGoal(steps: 10000, sleepMinutes: 480, activeMinutes: 45, workoutsPerWeek: 4)
+        // Demo intake goals — only visible when the nutrition feature is enabled in Settings.
+        goal.intakeCalories = 2200
+        goal.intakeProteinG = 140
+        goal.intakeCarbsG = 230
+        goal.intakeFatG = 70
+        context.insert(goal)
+
+        // Demo meals for today + yesterday (dormant until the nutrition feature is enabled).
+        seedDemoMeals(context, calendar: calendar, now: now)
         // Advertise the full sensor suite so the demo surfaces every vital (stress/HRV/BP/fatigue/
         // glucose/temperature are capability-gated and stay hidden otherwise).
         context.insert(Device(
@@ -91,6 +100,27 @@ enum SeedData {
             context.insert(session)
             for block in blocks {
                 context.insert(SleepStageBlock(sessionId: session.id, startAt: block.startAt, startMinute: block.startMinute, durationMinutes: block.durationMinutes, stage: block.stage))
+            }
+
+            // A few recent days also get daytime nap(s) — separate sessions sharing the same waking
+            // day — so the Day-view sleep carousel (issue #59) has multiple sessions to page through.
+            for nap in napsForDay(i) {
+                guard let napStart = calendar.date(bySettingHour: nap.hour, minute: nap.minute, second: 0, of: dayDate) else { continue }
+                let napEnd = calendar.date(byAdding: .minute, value: nap.minutes, to: napStart) ?? napStart
+                let napBlocks = napStageBlocks(total: nap.minutes, start: napStart)
+                let napLight = napBlocks.filter { $0.stage == .light }.reduce(0) { $0 + $1.durationMinutes }
+                let napDeep = napBlocks.filter { $0.stage == .deep }.reduce(0) { $0 + $1.durationMinutes }
+                let napAwake = napBlocks.filter { $0.stage == .awake }.reduce(0) { $0 + $1.durationMinutes }
+                let napSummary = SleepSummary(
+                    session: SleepSession(date: dayDate, startAt: napStart, endAt: napEnd, totalMinutes: nap.minutes),
+                    lightMinutes: napLight, deepMinutes: napDeep, awakeMinutes: napAwake, blocks: napBlocks
+                )
+                let napScore = SleepScore.calculate(napSummary)
+                let napSession = SleepSession(date: dayDate, startAt: napStart, endAt: napEnd, totalMinutes: nap.minutes, score: napScore.score, syncedAt: napEnd)
+                context.insert(napSession)
+                for block in napBlocks {
+                    context.insert(SleepStageBlock(sessionId: napSession.id, startAt: block.startAt, startMinute: block.startMinute, durationMinutes: block.durationMinutes, stage: block.stage))
+                }
             }
         }
 
@@ -151,6 +181,48 @@ enum SeedData {
         context.insert(DerivedUpdateRow(kind: "seed", entityType: "database", entityId: "demo", payloadJSON: #"{"source":"SeedData"}"#))
         
         try? context.save()
+    }
+
+    /// One demo meal to insert.
+    private struct MealSeed {
+        let dayOffset: Int
+        let hour: Int
+        let name: String
+        let type: MealType
+        let kcal: Double
+        let protein: Double
+        let carbs: Double
+        let fat: Double
+        let source: MealEntrySource
+    }
+
+    /// Demo meals for today + yesterday. Dormant until the nutrition feature is enabled in Settings.
+    @MainActor
+    private static func seedDemoMeals(_ context: ModelContext, calendar: Calendar, now: Date) {
+        let seeds: [MealSeed] = [
+            MealSeed(dayOffset: 0, hour: 8, name: "Greek yogurt bowl", type: .breakfast,
+                     kcal: 320, protein: 22, carbs: 38, fat: 9, source: .offSearch),
+            MealSeed(dayOffset: 0, hour: 13, name: "Chicken salad", type: .lunch,
+                     kcal: 520, protein: 38, carbs: 24, fat: 28, source: .llmEstimate),
+            MealSeed(dayOffset: 0, hour: 16, name: "Oat latte", type: .snack,
+                     kcal: 120, protein: 6, carbs: 10, fat: 6, source: .manual),
+            MealSeed(dayOffset: -1, hour: 8, name: "Overnight oats", type: .breakfast,
+                     kcal: 380, protein: 18, carbs: 52, fat: 11, source: .offSearch),
+            MealSeed(dayOffset: -1, hour: 13, name: "Turkey sandwich", type: .lunch,
+                     kcal: 540, protein: 32, carbs: 55, fat: 20, source: .manual),
+            MealSeed(dayOffset: -1, hour: 19, name: "Salmon & rice", type: .dinner,
+                     kcal: 680, protein: 42, carbs: 60, fat: 26, source: .llmEstimate),
+        ]
+        for seed in seeds {
+            guard let day = calendar.date(byAdding: .day, value: seed.dayOffset, to: now),
+                  let timestamp = calendar.date(bySettingHour: seed.hour, minute: 15, second: 0, of: day)
+            else { continue }
+            context.insert(MealEntry(
+                timestamp: timestamp, name: seed.name, mealType: seed.type,
+                calories: seed.kcal, proteinG: seed.protein, carbsG: seed.carbs, fatG: seed.fat,
+                source: seed.source
+            ))
+        }
     }
 
     /// Seeds every vital's measurement history for the demo. Each series is deterministic (no RNG) and
@@ -274,6 +346,8 @@ enum SeedData {
         deleteAll(CoachMessage.self, context)
         deleteAll(CoachMemory.self, context)
         deleteAll(CoachToolCall.self, context)
+        deleteAll(MealEntry.self, context)
+        deleteAll(CachedFoodProduct.self, context)
         try? context.save()
     }
     
@@ -303,7 +377,46 @@ enum SeedData {
         }
         return blocks
     }
-    
+
+    /// A seeded daytime nap: local hour/minute it starts and how long it runs.
+    private struct SeedNap { let hour: Int; let minute: Int; let minutes: Int }
+
+    /// Naps to seed for the night `dayIndex` days ago. Kept sparse and varied so the sleep carousel
+    /// shows a mix of single-session days, a two-session day, and a three-session day. All start
+    /// before 7 PM so they stay on the same waking day as that morning's night session.
+    private static func napsForDay(_ dayIndex: Int) -> [SeedNap] {
+        switch dayIndex {
+        // Today is the richest day so the multi-session carousel is testable on the Day view (which
+        // shows only today until day navigation lands): night + 2 naps = 3 pages.
+        case 0: return [SeedNap(hour: 11, minute: 0, minutes: 45), SeedNap(hour: 15, minute: 30, minutes: 52)]
+        case 1: return [SeedNap(hour: 10, minute: 30, minutes: 40), SeedNap(hour: 16, minute: 0, minutes: 35)]
+        case 2: return [SeedNap(hour: 13, minute: 0, minutes: 66)]
+        case 5: return [SeedNap(hour: 15, minute: 15, minutes: 24)]
+        default: return []
+        }
+    }
+
+    /// A short, nap-shaped stage architecture (mostly light with a little deep, no REM/awake),
+    /// scaled to `total` minutes. Mirrors `stageBlocks` but tuned for a brief daytime sleep.
+    private static func napStageBlocks(total: Int, start: Date) -> [SleepStageBlock] {
+        let pattern: [(SleepStage, Int)] = [(.light, 14), (.deep, 18), (.light, 13)]
+        let referenceTotal = pattern.reduce(0) { $0 + $1.1 }
+        let scale = Double(total) / Double(referenceTotal)
+        let placeholder = UUID()
+        var cursor = start
+        var minute = 0
+        var blocks: [SleepStageBlock] = []
+        for (index, item) in pattern.enumerated() {
+            let duration = index == pattern.count - 1
+                ? max(1, total - minute)
+                : max(1, Int((Double(item.1) * scale).rounded()))
+            blocks.append(SleepStageBlock(sessionId: placeholder, startAt: cursor, startMinute: minute, durationMinutes: duration, stage: item.0))
+            cursor = Calendar.current.date(byAdding: .minute, value: duration, to: cursor) ?? cursor
+            minute += duration
+        }
+        return blocks
+    }
+
     /// Inserts a synthetic GPS loop (~60 points) around `origin` so the route map has data to draw
     /// in the Simulator. The path is a gently wobbling closed loop, not a real recording.
     private static func seedRoute(_ context: ModelContext, sessionId: UUID, start: Date, durationMinutes: Int, origin: (Double, Double)) {

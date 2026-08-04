@@ -1,8 +1,7 @@
 ---
 title: TK5 / SmartHealth
 description: >-
-  The TK5 ring (SmartHealth app) — the Yucheng YCBT protocol, rebuilt from the
-  decompiled vendor SDK. Broad metric support; awaiting on-device confirmation.
+  The TK5 ring (SmartHealth app) — the Yucheng YCBT protocol. Broad metric support.
 ---
 
 # TK5 / SmartHealth
@@ -12,9 +11,6 @@ description: >-
 The TK5 pairs with the **SmartHealth** app (`com.zhuoting.healthyucheng`) and speaks the **Yucheng
 YCBT** protocol on a `be940` service — nothing in common at the wire level with the
 [56ff / Jring](jring.md) or [Colmi / Yawell QRing](colmi.md) families.
-
-PulseLoop's driver is reconstructed from the **decompiled Yucheng YCBT SDK** (`com.yucheng.ycbtsdk`,
-v4.0.10) that ships inside the SmartHealth Android app.
 
 !!! warning "Limited support — the protocol is proven, the TK5 hasn't been re-tested"
     The YCBT stack is confirmed working on real hardware — but on a *sibling* ring, the
@@ -28,18 +24,20 @@ v4.0.10) that ships inside the SmartHealth Android app.
 
 ## Not the only ring that speaks it
 
-The TK5 is one of **two** ring families PulseLoop drives over YCBT. The other is
-**[Colmi rings that ship with SmartHealth](colmi.md#smarthealth-app-colmi-rings)** instead of QRing.
-The protocol is byte-identical, so they share the whole driver (the device-neutral `YCBT*` core); each
-family adds only a coordinator with its advertisement matcher and capability set. They differ in two
-ways:
+The TK5 is one of **three** ring families PulseLoop drives over YCBT. The others are the
+**[R10M / LittleMeatball](r10m.md)** and **[Colmi rings that ship with SmartHealth](colmi.md#smarthealth-app-colmi-rings)**
+instead of QRing. The protocol is byte-identical, so they share the whole driver (the device-neutral
+`YCBT*` core); each family adds only a coordinator with its advertisement matcher and capability set,
+plus a small profile for firmware quirks. They differ in three ways:
 
-| | TK5 | SmartHealth-Colmi |
-|---|---|---|
-| **Advertisement** | `TK5 <4 hex>` — unambiguous, so it auto-detects | a Colmi-line name, which a *QRing* Colmi can also carry, so PulseLoop asks which app the ring came with |
-| **SupportFunction bitmap** (`02 01`) | gates temperature, BP, stress, fatigue, blood sugar. HRV is **not** gated — it was observed working on this ring | gates those *and* HRV, which the tested R09 denies |
+| | TK5 | R10M | SmartHealth-Colmi |
+|---|---|---|---|
+| **Advertisement** | `TK5 <4 hex>` — unambiguous, so it auto-detects | `R10M <4 hex>` **and** the `be940000` service | a Colmi-line name, which a *QRing* Colmi can also carry, so PulseLoop asks which app the ring came with |
+| **Hardware validation** | none — the protocol is proven on a sibling, this ring isn't | ✅ full session on FW 2.32 | an R99 runs it daily |
+| **SupportFunction bitmap** (`02 01`) | gates temperature, BP, stress, fatigue, blood sugar. HRV is **not** gated — it was observed working on this ring | gates all of those *and* HRV | gates those *and* HRV, which the tested R09 denies |
 
-A fix to any `YCBT*` file fixes both rings; a regression in one breaks both.
+A fix to any `YCBT*` file fixes all three rings; a regression in one breaks all three. The R10M also
+suppresses two commands the other two send — see [its firmware quirks](r10m.md#firmware-quirks).
 
 ## At a glance
 
@@ -80,18 +78,6 @@ right-hand column is the honest one: what a physical ring still has to confirm.
 at all: they are offered only if *this* unit's `02 01` capability bitmap sets their bit
 (`YCBTSupportFunction` → `TK5Coordinator.bitmapGatedCapabilities`). Everything else is a **baseline**
 promise — the app claims it unconditionally, and the bitmap can only ever *add*, never remove.
-
-The reason for the split is a sibling ring. The owner's **R99** (a Colmi on this same YCBT protocol)
-had HRV promised unconditionally, denied it four independent ways — bitmap bit clear, `01 45` → `0xFC`,
-`05 33` → `0xFC`, `03 2f` mode `0a` → outright refusal — and the "Measure HRV" button spun for 45 s and
-failed, every time. The TK5's temperature / stress / fatigue / blood-sugar claims rested on exactly the
-same kind of reasoning that produced that bug (*the SDK defines the record type*), and no TK5 has ever
-been seen producing one of those records. So the ring now says, and the app listens.
-
-**HRV is the exception that proves it**: it stays a baseline promise because it was *observed working on
-a TK5* (48 / 79 ms, cross-checked against the vendor app). Evidence from the hardware outranks a bit —
-and since no TK5 `02 01` reply has ever been captured, gating HRV could only risk losing a feature that
-demonstrably works.
 
 | Capability | Status | Needs on-device confirmation | Notes |
 |---|:---:|---|---|
@@ -167,15 +153,7 @@ app-side: every history sample upserts on `(kind, timestamp)`, activity buckets 
 epoch, and the cumulative step counter is a per-day `max` ratchet. All three are idempotent under
 replay, so a double-sync produces no duplicates. The cost is a longer sync as the ring's log fills.
 
-(An earlier version of the driver sent `05 40/42/43/44/4E` *believing they enabled monitoring*. They
-are the delete opcodes. The real enables are the five `01 xx {enable, interval}` monitor commands.)
-
 ## Known limitations
-
-- **No TK5 has run this driver yet.** The protocol is confirmed on a [sibling YCBT ring](colmi.md#smarthealth-app-colmi-rings)
-  and the layouts come from the vendor SDK, but the TK5-specific items in
-  [Needs on-device confirmation](#needs-on-device-confirmation) are still open, which is why support
-  stays "Limited". See [Contributing](../project/contributing.md) if you own one.
 - **~8-day history horizon.** `RingEventBridge` drops any history sample, sleep session or activity
   timestamp outside `now − 8 days … now + 1 hour`. A ring's log can hold records stamped under a
   *previous* clock, which decode hours or days out of place — and because history rows upsert, one
@@ -190,8 +168,10 @@ are the delete opcodes. The real enables are the five `01 xx {enable, interval}`
   emits a cached resting HR (~87 bpm) even off-finger, which would mask real readings. Live HR comes
   solely from the proprietary `06 01` stream, as in the official app.
 - **Timestamps are timezone-naive.** The ring stores local wall-clock seconds with no timezone byte,
-  so the decoder un-applies the device's UTC offset to recover the true instant. This is exact for
-  same-session syncs and can be an hour off across a DST transition.
+  so the decoder un-applies the device's UTC offset to recover the true instant. The offset is
+  resolved at each record's *own* date, so history read across a DST change decodes correctly; the
+  only residue is the ambiguous hour a fall-back repeats and the hour a spring-forward skips, which
+  the wire format simply cannot disambiguate.
 
 ---
 

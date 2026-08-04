@@ -122,12 +122,34 @@ enum YCBTBytes {
     /// time, so decoding must un-apply the device's UTC offset to recover the true absolute instant.
     /// Without this, `Calendar.current` re-applies that same offset when a caller later extracts
     /// local components (e.g. `Calendar.wakingDay(forSleepStart:)`'s hour check), doubling it instead
-    /// of cancelling it. Uses the *current* offset as an approximation of the offset in effect when
-    /// the timestamp was recorded — correct for same-session syncs, only wrong across a DST
-    /// transition that happens between recording and decoding.
+    /// of cancelling it.
+    ///
+    /// The offset is resolved **at the timestamp's own date**, not today's. Reading the ring seconds as
+    /// UTC recovers the wall-clock fields the ring actually stored; re-interpreting those fields in the
+    /// local zone then picks whichever offset was in force *then*. Subtracting today's offset instead —
+    /// which is what this did — silently shifts every record on the far side of a DST transition by an
+    /// hour, so a Sunday-night sleep session read on Monday lands in the wrong hour bucket and, near
+    /// midnight, the wrong day. `ringSeconds(_:)` has always been date-aware; this makes the pair
+    /// symmetric.
+    ///
+    /// Ambiguous and skipped wall-clock times (the hour that repeats in autumn, the hour that doesn't
+    /// exist in spring) resolve however `Calendar` resolves them — earliest match and forward shift
+    /// respectively. Both are one-hour errors in a one-hour window per year, and neither is recoverable
+    /// from the wire: the ring simply does not record which side of the transition it meant.
     static func date(_ ringSeconds: Int, timeZone: TimeZone = .current) -> Date {
-        let offset = TimeInterval(timeZone.secondsFromGMT())
-        return Date(timeIntervalSince1970: TimeInterval(ringSeconds) + epochOffset - offset)
+        let wallClock = Date(timeIntervalSince1970: TimeInterval(ringSeconds) + epochOffset)
+        var utcCalendar = Calendar(identifier: .gregorian)
+        utcCalendar.timeZone = TimeZone(secondsFromGMT: 0) ?? timeZone
+        let fields: Set<Calendar.Component> = [.year, .month, .day, .hour, .minute, .second]
+        var localCalendar = Calendar(identifier: .gregorian)
+        localCalendar.timeZone = timeZone
+        guard let resolved = localCalendar.date(from: utcCalendar.dateComponents(fields, from: wallClock))
+        else {
+            // Unreachable for a Gregorian calendar with complete components; fall back to the old
+            // fixed-offset behaviour rather than returning a timestamp that isn't a time at all.
+            return wallClock.addingTimeInterval(-TimeInterval(timeZone.secondsFromGMT()))
+        }
+        return resolved
     }
 
     /// Convert a `Date` to ring seconds (2000-epoch), the inverse of `date(_:timeZone:)`.

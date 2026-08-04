@@ -25,9 +25,12 @@ enum ActionTools {
         .make(
             name: "set_goal",
             label: "Saving your goal",
-            description: "Create or update a daily/weekly fitness goal.",
+            description: "Create or update a daily/weekly fitness goal. Nutrition intake goals (calorie_intake and the per-macro gram targets) apply to the calorie-tracking feature.",
             parameters: JSONSchema.object([
-                "goal_type": JSONSchema.enumString(["steps", "sleep_hours", "active_minutes", "exercise_days"]),
+                "goal_type": JSONSchema.enumString([
+                    "steps", "sleep_hours", "active_minutes", "exercise_days",
+                    "calorie_intake", "protein_g", "carbs_g", "fat_g",
+                ]),
                 "target": JSONSchema.number,
                 "reason": JSONSchema.string,
             ], required: ["goal_type", "target", "reason"]),
@@ -41,10 +44,16 @@ enum ActionTools {
             case "sleep_hours": goal.sleepMinutes = Int(args.target * 60)
             case "active_minutes": goal.activeMinutes = Int(args.target)
             case "exercise_days": goal.workoutsPerWeek = Int(args.target)
+            // Intake goals (NOT `goal.calories`, which is the active-energy burn goal).
+            case "calorie_intake": goal.intakeCalories = Int(args.target)
+            case "protein_g": goal.intakeProteinG = Int(args.target)
+            case "carbs_g": goal.intakeCarbsG = Int(args.target)
+            case "fat_g": goal.intakeFatG = Int(args.target)
             default: return .error("invalid goal_type '\(args.goalType)'")
             }
             goal.updatedAt = Date()
             try? ctx.modelContext.save()
+            PulseDataChange.shared.notify()
             return .object(["ok": true, "goal_type": args.goalType, "target": args.target])
         }
     }
@@ -294,15 +303,36 @@ enum ActionTools {
     // MARK: - shared
 
     private static func applyUpdatesNow(_ updates: ActivityUpdates, to session: ActivitySession, context: ModelContext) {
-        if let type = updates.type { session.type = type }
         if let notes = updates.notes { session.notes = notes }
-        if let distanceKm = updates.distanceKm { session.distanceMeters = distanceKm * 1000 }
         if let effort = updates.perceivedEffort { session.perceivedEffort = effort }
-        if let start = updates.startTime, let date = CoachDataAccess.parseLocalDate(start) { session.startedAt = date }
+
+        // Type/time changes must route through the edit service so aggregates, the sample window,
+        // and the daily rollup stay consistent — setting the fields directly left them all stale
+        // (Today/Activity kept the old duration/distance/calories). Mirrors `PendingActionExecutor`.
+        let newType = updates.type ?? session.type
+        var newStart = session.startedAt
+        if let start = updates.startTime, let date = CoachDataAccess.parseLocalDate(start) { newStart = date }
+        var newEnd = session.endedAt ?? Date()
         if let durationMin = updates.durationMin {
-            session.endedAt = session.startedAt.addingTimeInterval(durationMin * 60 + session.totalPauseSeconds)
+            newEnd = newStart.addingTimeInterval(durationMin * 60 + session.totalPauseSeconds)
+        } else if newStart != session.startedAt {
+            // Start moved without a new duration: shift the whole window, keeping its span.
+            newEnd = newStart.addingTimeInterval((session.endedAt ?? Date()).timeIntervalSince(session.startedAt))
         }
+        let didEdit = newType != session.type || newStart != session.startedAt || newEnd != session.endedAt
+        if didEdit {
+            _ = ActivityService.applyEdit(
+                session: session, newType: newType, newStartedAt: newStart, newEndedAt: newEnd, context: context
+            )
+        }
+
+        // A user-stated distance overrides the GPS recompute, so apply it after the edit.
+        if let distanceKm = updates.distanceKm { session.distanceMeters = distanceKm * 1000 }
+
         session.updatedAt = Date()
         try? context.save()
+        // `applyEdit` already notified; only notify again when it didn't run or we changed
+        // something after it (the distance override), so a plain edit doesn't double-bump.
+        if !didEdit || updates.distanceKm != nil { PulseDataChange.shared.notify() }
     }
 }

@@ -16,6 +16,9 @@ struct CoachView: View {
     /// so it reads the same whether it's presented as a tab or (as now) as a sheet —
     /// the presenter decides how to get to the activity detail.
     var onOpenWorkout: ((UUID) -> Void)?
+    /// Called when a meal card in the chat is tapped — same presenter-decides
+    /// routing contract as `onOpenWorkout`.
+    var onOpenMeal: ((UUID) -> Void)?
     @Environment(\.modelContext) private var modelContext
     @Environment(RingSyncCoordinator.self) private var coordinator
     @Query(sort: \CoachMessage.createdAt) private var allMessages: [CoachMessage]
@@ -84,7 +87,8 @@ struct CoachView: View {
                                 onChipTap: { send($0) },
                                 onConfirm: { viewModel.confirmPendingAction(message, context: modelContext) },
                                 onCancel: { viewModel.cancelPendingAction(message, context: modelContext) },
-                                onOpenWorkout: { openWorkout($0) }
+                                onOpenWorkout: { openWorkout($0) },
+                                onOpenMeal: { openMeal($0) }
                             ).id(message.id)
                         }
                         if viewModel.isSending {
@@ -122,6 +126,8 @@ struct CoachView: View {
                             }
                         }
                         .padding(.horizontal, 12).padding(.vertical, 8)
+                        // Prompt chips share one container so their glass renders/blends together.
+                        .pulseGlassContainer(spacing: 6)
                     }
                 }
                 composer
@@ -180,6 +186,12 @@ struct CoachView: View {
         onOpenWorkout?(id)
     }
 
+    /// Open the meal detail for a meal logged in chat, mirroring `openWorkout`.
+    private func openMeal(_ id: UUID) {
+        composerFocused = false
+        onOpenMeal?(id)
+    }
+
     private var header: some View {
         HStack(spacing: 12) {
             CoachOrb(size: 40)
@@ -188,18 +200,22 @@ struct CoachView: View {
                 Text("Using your latest ring sync").font(PulseFont.caption2.weight(.regular)).foregroundStyle(PulseColors.textMuted)
             }
             Spacer()
-            Button { composerFocused = false; showUsage = true } label: {
-                Image(systemName: "info.circle").font(PulseFont.body).foregroundStyle(PulseColors.textSecondary)
-                    .frame(width: 36, height: 36).pulseGlass(Circle(), interactive: true)
+            // Sibling glass circles share one container so their glass renders/blends together.
+            HStack(spacing: 12) {
+                Button { composerFocused = false; showUsage = true } label: {
+                    Image(systemName: "info.circle").font(PulseFont.body).foregroundStyle(PulseColors.textSecondary)
+                        .frame(width: 36, height: 36).pulseGlass(Circle(), interactive: true)
+                }
+                Button { newConversation() } label: {
+                    Image(systemName: "plus").font(PulseFont.body).foregroundStyle(PulseColors.textSecondary)
+                        .frame(width: 36, height: 36).pulseGlass(Circle(), interactive: true)
+                }
+                Button { composerFocused = false; showHistory = true } label: {
+                    Image(systemName: "clock.arrow.circlepath").font(PulseFont.body).foregroundStyle(PulseColors.textSecondary)
+                        .frame(width: 36, height: 36).pulseGlass(Circle(), interactive: true)
+                }
             }
-            Button { newConversation() } label: {
-                Image(systemName: "plus").font(PulseFont.body).foregroundStyle(PulseColors.textSecondary)
-                    .frame(width: 36, height: 36).pulseGlass(Circle(), interactive: true)
-            }
-            Button { composerFocused = false; showHistory = true } label: {
-                Image(systemName: "clock.arrow.circlepath").font(PulseFont.body).foregroundStyle(PulseColors.textSecondary)
-                    .frame(width: 36, height: 36).pulseGlass(Circle(), interactive: true)
-            }
+            .pulseGlassContainer(spacing: 8)
         }
         .padding(.horizontal, 16).padding(.vertical, 12)
         .background(PulseColors.secondaryBackground)
@@ -243,6 +259,8 @@ struct CoachView: View {
                 .buttonStyle(.plain)
                 .disabled(!canSend)
             }
+            // Camera / field / send glass share one container so they render/blend together.
+            .pulseGlassContainer(spacing: 8)
         }
         .padding(.horizontal, 12).padding(.vertical, 10)
         .photosPicker(isPresented: $showPhotosPicker, selection: $photosPickerItem, matching: .images)
@@ -454,10 +472,20 @@ struct CoachBubble: View {
     var onConfirm: (() -> Void)?
     var onCancel: (() -> Void)?
     var onOpenWorkout: ((UUID) -> Void)?
+    var onOpenMeal: ((UUID) -> Void)?
 
     /// Activity ids logged/edited by this turn — drive the in-chat workout card.
     private var loggedActivityIds: [UUID] {
-        guard let json = message.loggedActivityIdsJSON, let data = json.data(using: .utf8) else { return [] }
+        Self.decodeIds(message.loggedActivityIdsJSON)
+    }
+
+    /// Meal ids logged/edited by this turn — drive the in-chat meal card.
+    private var loggedMealIds: [UUID] {
+        Self.decodeIds(message.loggedMealIdsJSON)
+    }
+
+    private static func decodeIds(_ json: String?) -> [UUID] {
+        guard let json, let data = json.data(using: .utf8) else { return [] }
         return (try? JSONDecoder().decode([UUID].self, from: data)) ?? []
     }
 
@@ -497,6 +525,9 @@ struct CoachBubble: View {
                 if isAssistantOrError {
                     ForEach(loggedActivityIds, id: \.self) { id in
                         CoachWorkoutCard(activityId: id, onOpen: { onOpenWorkout?($0) })
+                    }
+                    ForEach(loggedMealIds, id: \.self) { id in
+                        CoachMealCard(mealId: id, onOpen: { onOpenMeal?($0) })
                     }
                     CoachToolTraceDisclosure(messageId: message.id)
                 }

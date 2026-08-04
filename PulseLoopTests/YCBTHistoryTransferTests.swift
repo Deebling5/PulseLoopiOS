@@ -150,6 +150,100 @@ final class YCBTHistoryTransferTests: XCTestCase {
         XCTAssertTrue(writer.sent.isEmpty, "types the firmware rejected are not re-requested this session")
     }
 
+    // MARK: Terminal cross-check
+
+    /// The CRC alone does not catch a **short** buffer. A dropped data frame leaves us holding fewer
+    /// bytes than the ring sent; cross-checking the terminal's packet and byte counts against both the
+    /// header's promise and the buffer we actually built turns "silently short" into a NAK and a retry.
+    func testTerminalWithMismatchedCountsIsNakedAndRetried() {
+        let writer = FakeWriter()
+        let transfer = YCBTHistoryTransfer(writer: writer)
+        transfer.start(types: [.heart])
+        _ = transfer.handle(cmd: 0x06, payload: header(records: 2, packets: 1, bytes: heartBuffer.count))
+        _ = transfer.handle(cmd: 0x15, payload: Array(heartBuffer.prefix(6)))   // one frame lost
+        writer.sent.removeAll()
+
+        // The ring's terminal describes what it *sent* — 12 bytes — but we only hold 6.
+        let events = transfer.handle(cmd: 0x80, payload: terminal(packets: 1, buffer: heartBuffer))
+
+        XCTAssertEqual(writer.sent.first, ackCrcFailure, "a short buffer must be NAKed, not accepted")
+        XCTAssertEqual(writer.sent.last, heartQuery, "and the type re-requested")
+        XCTAssertTrue(events.isEmpty, "nothing may be decoded from a buffer we know is incomplete")
+    }
+
+    /// A terminal whose counts disagree with the *header* is equally untrustworthy, even when its own
+    /// byte count happens to match the buffer.
+    func testTerminalDisagreeingWithTheHeaderIsNaked() {
+        let writer = FakeWriter()
+        let transfer = YCBTHistoryTransfer(writer: writer)
+        transfer.start(types: [.heart])
+        _ = transfer.handle(cmd: 0x06, payload: header(records: 2, packets: 9, bytes: heartBuffer.count))
+        _ = transfer.handle(cmd: 0x15, payload: heartBuffer)
+        writer.sent.removeAll()
+
+        _ = transfer.handle(cmd: 0x80, payload: terminal(packets: 1, buffer: heartBuffer))
+
+        XCTAssertEqual(writer.sent.first, ackCrcFailure)
+    }
+
+    /// The happy path must be unaffected: matching counts and CRC still ACK and decode.
+    func testMatchingCountsStillAcceptTheTransfer() {
+        let writer = FakeWriter()
+        let transfer = YCBTHistoryTransfer(writer: writer)
+        transfer.start(types: [.heart])
+        _ = transfer.handle(cmd: 0x06, payload: header(records: 2, packets: 1, bytes: heartBuffer.count))
+        _ = transfer.handle(cmd: 0x15, payload: heartBuffer)
+        writer.sent.removeAll()
+
+        let events = transfer.handle(cmd: 0x80, payload: terminal(packets: 1, buffer: heartBuffer))
+
+        XCTAssertEqual(writer.sent.first, ackAccepted)
+        XCTAssertEqual(events.filter { if case .historyMeasurement = $0 { return true } else { return false } }.count, 2)
+    }
+
+    // MARK: append
+
+    /// The ring's `02 01` bitmap arrives *during* the startup walk, so the types it unlocks have to join
+    /// the queue without disturbing the block in flight — `start` refuses outright while active, which is
+    /// right for a second full pass and wrong for this.
+    func testAppendExtendsTheQueueWithoutDisturbingTheInFlightType() {
+        let writer = FakeWriter()
+        let transfer = YCBTHistoryTransfer(writer: writer)
+        transfer.start(types: [.heart])
+        _ = transfer.handle(cmd: 0x06, payload: header(records: 2, packets: 1, bytes: heartBuffer.count))
+        _ = transfer.handle(cmd: 0x15, payload: heartBuffer)
+        writer.sent.removeAll()
+
+        transfer.append(types: [.all])
+        XCTAssertTrue(writer.sent.isEmpty, "append must not interrupt the block being received")
+
+        _ = transfer.handle(cmd: 0x80, payload: terminal(packets: 1, buffer: heartBuffer))
+        XCTAssertEqual(writer.sent.last, allQuery, "the appended type is requested when the queue reaches it")
+    }
+
+    /// Appending while idle has to start the machine, or a bitmap that lands after a finished walk would
+    /// leave its types unfetched until the next sync.
+    func testAppendStartsTheMachineWhenIdle() {
+        let writer = FakeWriter()
+        let transfer = YCBTHistoryTransfer(writer: writer)
+
+        transfer.append(types: [.all])
+
+        XCTAssertEqual(writer.sent, [allQuery])
+    }
+
+    /// Asking twice would re-dump a log we already hold and re-upsert every record in it.
+    func testAppendIgnoresTypesAlreadyQueuedOrInFlight() {
+        let writer = FakeWriter()
+        let transfer = YCBTHistoryTransfer(writer: writer)
+        transfer.start(types: [.heart, .all])
+        writer.sent.removeAll()
+
+        transfer.append(types: [.heart, .all])
+
+        XCTAssertTrue(writer.sent.isEmpty, "neither the in-flight type nor a queued one may be re-added")
+    }
+
     // MARK: Queue composition (A3)
 
     /// The engine asks for the full nine-type catalog, in the SDK's ascending-key order
@@ -160,7 +254,7 @@ final class YCBTHistoryTransferTests: XCTestCase {
     func testEngineRequestsEveryHistoryTypeInOrder() {
         let writer = FakeWriter()
         let transfer = YCBTHistoryTransfer(writer: writer)
-        let engine = YCBTSyncEngine(writer: writer, transfer: transfer)
+        let engine = YCBTSyncEngine(writer: writer, transfer: transfer, profile: .permissiveTestProfile)
         engine.runStartup()
 
         var requested: [UInt8] = []
@@ -173,6 +267,104 @@ final class YCBTHistoryTransferTests: XCTestCase {
         XCTAssertEqual(requested, [0x02, 0x04, 0x06, 0x08, 0x09, 0x1a, 0x1e, 0x2f, 0x33])
     }
 
+    // MARK: Capability-gated queue
+
+    /// A ring that doesn't implement a type answers "no data" or `0xFC`, both handled — so this is not
+    /// about correctness, it is about not spending ten seconds of watchdog per absent type on every
+    /// single sync. For the R10M baseline that leaves exactly four queries.
+    func testR10MStartupAsksOnlyForTheLogsItKeeps() {
+        let writer = FakeWriter()
+        let transfer = YCBTHistoryTransfer(writer: writer)
+        let engine = YCBTSyncEngine(writer: writer, transfer: transfer, profile: YCBTFamilyProfile(
+            baselineCapabilities: YCBTCoordinator().capabilities,
+            bitmapGatedCapabilities: YCBTCoordinator().bitmapGatedCapabilities,
+            queryChipSchemeAtStartup: false,
+            supportsBloodPressureMonitor: false
+        ))
+        engine.runStartup()
+
+        var requested: [UInt8] = []
+        while let query = writer.sent.last(where: { $0.count == 2 && $0[0] == 0x05 }) {
+            requested.append(query[1])
+            writer.sent.removeAll()
+            _ = transfer.handle(cmd: query[1], payload: [0x00])   // "no data" → advance
+        }
+        XCTAssertEqual(requested, [0x02, 0x04, 0x06, 0x09], "sport, sleep, heart, all — and nothing else")
+        XCTAssertFalse(requested.contains(0x1a), "no dedicated SpO₂ log on this ring")
+    }
+
+    /// A capability the bitmap unlocks mid-walk has to reach the queue, or its log waits for the next
+    /// sync. `.all` is re-queued alongside because BP is an *optional field* of a record we already ran —
+    /// so the run that just happened decoded it with that field dropped.
+    func testALateBitmapAppendsTheNewlyUnlockedTypes() {
+        let writer = FakeWriter()
+        let transfer = YCBTHistoryTransfer(writer: writer)
+        let engine = YCBTSyncEngine(writer: writer, transfer: transfer, profile: YCBTFamilyProfile(
+            baselineCapabilities: [.heartRate],
+            bitmapGatedCapabilities: [.bloodPressure]
+        ))
+        // Baseline is heart-rate only, so the startup queue is heart + all (all is never gated).
+        engine.runStartup()
+        // The bitmap lands while `05 06` is still in flight — the case `start` cannot serve.
+        engine.handle(.supportFunctions([.bloodPressure]))
+
+        var requested: [UInt8] = []
+        while let query = writer.sent.last(where: { $0.count == 2 && $0[0] == 0x05 }) {
+            requested.append(query[1])
+            writer.sent.removeAll()
+            _ = transfer.handle(cmd: query[1], payload: [0x00])   // "no data" → advance
+        }
+        XCTAssertEqual(requested, [0x06, 0x09, 0x08], "the blood-pressure log joins the queue behind the rest")
+    }
+
+    /// A bitmap that lands *after* the walk finished has to restart the machine for its new types — the
+    /// `05 09` combined record it already ran was decoded with the BP fields dropped.
+    func testALateBitmapAfterTheWalkRerunsTheCombinedRecord() {
+        let writer = FakeWriter()
+        let transfer = YCBTHistoryTransfer(writer: writer)
+        let engine = YCBTSyncEngine(writer: writer, transfer: transfer, profile: YCBTFamilyProfile(
+            baselineCapabilities: [.heartRate],
+            bitmapGatedCapabilities: [.bloodPressure]
+        ))
+        engine.runStartup()
+        while let query = writer.sent.last(where: { $0.count == 2 && $0[0] == 0x05 }) {
+            writer.sent.removeAll()
+            _ = transfer.handle(cmd: query[1], payload: [0x00])
+        }
+        writer.sent.removeAll()
+
+        engine.handle(.supportFunctions([.bloodPressure]))
+
+        var requested: [UInt8] = []
+        while let query = writer.sent.last(where: { $0.count == 2 && $0[0] == 0x05 }) {
+            requested.append(query[1])
+            writer.sent.removeAll()
+            _ = transfer.handle(cmd: query[1], payload: [0x00])
+        }
+        XCTAssertTrue(requested.contains(0x08), "the blood-pressure log is now worth asking for")
+        XCTAssertTrue(requested.contains(0x09), "and `all` is re-run for its optional BP fields")
+    }
+
+    /// The R10M ACKs the handshake's `03 09` but doesn't always start publishing until its history dump
+    /// is done, so today's steps sit at whatever the last session left. One extra frame after the walk
+    /// fixes a reconnect that otherwise looks frozen — and it must fire exactly once.
+    func testLiveStatusIsReassertedOnceAfterTheStartupWalk() {
+        let writer = FakeWriter()
+        let transfer = YCBTHistoryTransfer(writer: writer)
+        let engine = YCBTSyncEngine(writer: writer, transfer: transfer, profile: .permissiveTestProfile)
+        let liveStatus = Data([0x03, 0x09, 0x01, 0x00, 0x02])
+
+        engine.runStartup()
+        writer.sent.removeAll()
+
+        engine.handle(.historySyncFinished)
+        XCTAssertEqual(writer.sent, [liveStatus])
+
+        writer.sent.removeAll()
+        engine.handle(.historySyncFinished)
+        XCTAssertTrue(writer.sent.isEmpty, "only the startup walk earns the re-issue")
+    }
+
     // MARK: Targeted passes + re-entrancy (A5)
 
     /// The post-workout backfill asks for exactly the three logs a workout can have added to — heart
@@ -181,7 +373,7 @@ final class YCBTHistoryTransferTests: XCTestCase {
     func testSyncVitalsHistoryQueuesOnlyTheThreeVitalsTypes() {
         let writer = FakeWriter()
         let transfer = YCBTHistoryTransfer(writer: writer)
-        let engine = YCBTSyncEngine(writer: writer, transfer: transfer)
+        let engine = YCBTSyncEngine(writer: writer, transfer: transfer, profile: .permissiveTestProfile)
 
         engine.syncVitalsHistory()
 
@@ -198,12 +390,28 @@ final class YCBTHistoryTransferTests: XCTestCase {
     func testSyncHistoryRerunsTheFullCatalog() {
         let writer = FakeWriter()
         let transfer = YCBTHistoryTransfer(writer: writer)
-        let engine = YCBTSyncEngine(writer: writer, transfer: transfer)
+        let engine = YCBTSyncEngine(writer: writer, transfer: transfer, profile: .permissiveTestProfile)
 
         engine.syncHistory()
 
-        XCTAssertEqual(writer.sent, [Data([0x05, 0x02])], "the queue starts at the first catalog type")
-        XCTAssertTrue(writer.sent.allSatisfy { $0[0] == 0x05 }, "no handshake frames — history only")
+        XCTAssertEqual(
+            writer.sent,
+            [Data([0x03, 0x09, 0x01, 0x00, 0x02]), Data([0x05, 0x02])],
+            "live status is re-asserted, then the queue starts at the first catalog type"
+        )
+    }
+
+    /// Pull-to-refresh is the gesture a user makes *because* today's steps look stale, and on a ring whose
+    /// `03 09` subscription went quiet the history walk alone won't move them: the cumulative counter
+    /// arrives on the `06 00` stream, not in any log.
+    func testSyncHistoryReassertsLiveStatusBeforeTheWalk() {
+        let writer = FakeWriter()
+        let transfer = YCBTHistoryTransfer(writer: writer)
+        let engine = YCBTSyncEngine(writer: writer, transfer: transfer, profile: .permissiveTestProfile)
+
+        engine.syncHistory()
+
+        XCTAssertEqual(writer.sent.first, Data([0x03, 0x09, 0x01, 0x00, 0x02]))
     }
 
     /// Three callers can now ask for a transfer (connect, post-workout backfill, the 30-minute pass). A

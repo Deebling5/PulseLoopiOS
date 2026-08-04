@@ -12,6 +12,14 @@ enum RingDeviceType: String, Codable, CaseIterable, Sendable {
     /// that driver, not `ColmiDriver`. Which of the two a given ring is cannot be read off its
     /// advertisement — the user declares it at pairing (see `RingAppVariant`).
     case colmiSmartHealth
+    /// LuckRing / TK18 family (the "K6" vendor SDK, company ID `0xFF64`). Sold under simsonlab and other
+    /// brands; TK18 is the hardware-tested unit. See `LuckRingCoordinator`.
+    case luckRing
+    /// Generic YCBT / SmartHealth rings that are **not** part of the Colmi line and carry no TK5
+    /// identity — the LittleMeatball R10M is the hardware-validated unit. Same wire protocol as `.tk5`
+    /// and `.colmiSmartHealth` (so it shares the whole `YCBT*` stack), kept a separate family because its
+    /// capability set, product art and firmware quirks are its own. See `YCBTCoordinator`.
+    case ycbt
 
     /// Human-facing default name when no advertised name is available.
     var displayName: String {
@@ -20,6 +28,8 @@ enum RingDeviceType: String, Codable, CaseIterable, Sendable {
         case .colmiR02: return "Colmi / Yawell ring"
         case .tk5: return "TK5 ring"
         case .colmiSmartHealth: return "Colmi ring (SmartHealth)"
+        case .luckRing: return "LuckRing"
+        case .ycbt: return "YCBT / SmartHealth ring"
         }
     }
 }

@@ -177,7 +177,12 @@ final class YCBTSupportFunctionTests: XCTestCase {
         let capabilities: Set<WearableCapability> = [.heartRate, .steps, .battery]
         let bitmapGatedCapabilities: Set<WearableCapability> = [.temperature, .stress]
         let iconSystemName = "circle"
-        func makeDriver(writer: RingCommandWriter) -> WearableDriver { YCBTDriver(writer: writer) }
+        func makeDriver(writer: RingCommandWriter) -> WearableDriver {
+            YCBTDriver(writer: writer, profile: YCBTFamilyProfile(
+                baselineCapabilities: capabilities,
+                bitmapGatedCapabilities: bitmapGatedCapabilities
+            ))
+        }
     }
 
     /// A gated capability the ring claims is added.

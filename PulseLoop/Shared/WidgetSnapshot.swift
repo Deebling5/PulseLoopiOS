@@ -45,6 +45,56 @@ struct WidgetSnapshot: Codable {
     var sleep: WidgetSleepPayload?
     /// Keyed by `MetricKind.rawValue`.
     var metrics: [String: WidgetMetricPayload]
+    /// Calorie-intake tracking. Optional + defaulted so snapshots written by older builds decode;
+    /// nil while the nutrition feature (or its Today/widget toggle) is off.
+    var nutrition: WidgetNutritionPayload?
+
+    enum CodingKeys: String, CodingKey { case generatedAt, dayStart, activity, sleep, metrics, nutrition }
+
+    init(generatedAt: Date, dayStart: Date, activity: WidgetActivityPayload?, sleep: WidgetSleepPayload?,
+         metrics: [String: WidgetMetricPayload], nutrition: WidgetNutritionPayload? = nil) {
+        self.generatedAt = generatedAt
+        self.dayStart = dayStart
+        self.activity = activity
+        self.sleep = sleep
+        self.metrics = metrics
+        self.nutrition = nutrition
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        generatedAt = try c.decode(Date.self, forKey: .generatedAt)
+        dayStart = try c.decode(Date.self, forKey: .dayStart)
+        activity = try c.decodeIfPresent(WidgetActivityPayload.self, forKey: .activity)
+        sleep = try c.decodeIfPresent(WidgetSleepPayload.self, forKey: .sleep)
+        metrics = try c.decode([String: WidgetMetricPayload].self, forKey: .metrics)
+        nutrition = try c.decodeIfPresent(WidgetNutritionPayload.self, forKey: .nutrition)
+    }
+}
+
+// MARK: - Nutrition (calorie intake tile)
+
+struct WidgetNutritionPayload: Codable {
+    /// Eaten kcal + goal (0 = no goal set → track-only ring, matching the in-app tile).
+    var kcal: Double
+    var kcalGoal: Double
+    /// Center text: remaining kcal when a goal exists, else total eaten.
+    var centerText: String
+    /// "LEFT" / "OVER" / "KCAL", matching `NutritionTileView`.
+    var centerLabel: String
+    /// Resolved ring fill color (kcal orange, warning at 100–115% of goal, danger beyond) — the
+    /// app bakes the over-goal logic in so the extension needs no nutrition code.
+    var ringColorHex: String
+    var macroRows: [MacroRow]
+
+    struct MacroRow: Codable {
+        /// "P" / "C" / "F".
+        var letter: String
+        var text: String
+        var value: Double
+        var goal: Double
+        var colorHex: String
+    }
 }
 
 // MARK: - Activity (concentric rings tile)
@@ -164,6 +214,7 @@ extension VitalColorToken {
         case .orange: return "orange"
         case .red: return "red"
         case .brightRed: return "brightRed"
+        case .deepRed: return "deepRed"
         case .neutral: return "neutral"
         case .metricAccent(let metric): return Self.accentPrefix + metric.rawValue
         }
@@ -179,6 +230,7 @@ extension VitalColorToken {
         case "orange": self = .orange
         case "red": self = .red
         case "brightRed": self = .brightRed
+        case "deepRed": self = .deepRed
         default:
             if tokenString.hasPrefix(Self.accentPrefix),
                let metric = MetricKind(rawValue: String(tokenString.dropFirst(Self.accentPrefix.count))) {

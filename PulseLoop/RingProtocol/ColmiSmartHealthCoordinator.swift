@@ -201,6 +201,11 @@ final class ColmiSmartHealthCoordinator: WearableCoordinator {
     let iconSystemName = "circle.circle.fill"
 
     func makeDriver(writer: RingCommandWriter) -> WearableDriver {
-        YCBTDriver(writer: writer)
+        YCBTDriver(writer: writer, profile: YCBTFamilyProfile(
+            baselineCapabilities: capabilities,
+            bitmapGatedCapabilities: bitmapGatedCapabilities,
+            queryChipSchemeAtStartup: true,
+            supportsBloodPressureMonitor: true
+        ))
     }
 }

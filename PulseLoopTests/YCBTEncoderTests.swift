@@ -105,27 +105,92 @@ final class YCBTEncoderTests: XCTestCase {
     /// Order matters: the SmartHealth app interrogates the device before it writes settings, and the
     /// live-status push is last (`03 09 01 00 02` — without it the ring never streams `06 00` and live
     /// steps freeze).
+    ///
+    /// The clock (`01 00`) and the name read (`02 03`) are **not** here — they moved to
+    /// `postSubscriptionHandshake`, which `RingBLEClient` writes ahead of this whole sequence.
     func testStartupOrderMirrorsTheSmartHealthHandshake() {
         let sequence = encoder.startupSequence().map { Array($0.prefix(2)) }
 
-        XCTAssertEqual(sequence.first, [0x01, 0x00], "the clock goes first")
         XCTAssertEqual(sequence.last, [0x03, 0x09], "the live-status push goes last")
-        XCTAssertEqual(Array(sequence[1...5]), [
+        XCTAssertEqual(Array(sequence[0...3]), [
             [0x02, 0x00],   // GetDeviceInfo — battery + firmware
             [0x02, 0x01],   // GetSupportFunction — capability bitmap
             [0x02, 0x1b],   // GetChipScheme
-            [0x02, 0x03],   // GetDeviceName
             [0x02, 0x07],   // GetUserConfig
         ])
         XCTAssertEqual(encoder.startupSequence().last, [0x03, 0x09, 0x01, 0x00, 0x02])
 
         // Settings follow the interrogation: language, units, the five monitors, then the profile.
-        XCTAssertEqual(Array(sequence[6...]), [
+        XCTAssertEqual(Array(sequence[4...]), [
             [0x01, 0x12], [0x01, 0x04],
             [0x01, 0x0c], [0x01, 0x1c], [0x01, 0x20], [0x01, 0x26], [0x01, 0x45],
             [0x01, 0x03],
             [0x03, 0x09],
         ])
+    }
+
+    /// The two commands that lead, before anything the sync engine queues. The clock leads for a reason
+    /// beyond tidiness: every record the ring stores is stamped from its own RTC in local wall-clock, so
+    /// a clock written *after* the history walk has begun mis-stamps everything read before it.
+    func testPostSubscriptionHandshakeIsTheNameReadThenTheClock() {
+        let handshake = encoder.postSubscriptionHandshake()
+        XCTAssertEqual(handshake.count, 2)
+        XCTAssertEqual(handshake[0], [0x02, 0x03, 0x47, 0x50], "GetDeviceName — the cheapest proof of life")
+        XCTAssertEqual(Array(handshake[1].prefix(2)), [0x01, 0x00], "then SetTime")
+    }
+
+    // MARK: Family quirks
+
+    /// The R10M closes an otherwise healthy link with HCI 0x13 when asked for the chip scheme, and does
+    /// not implement the all-day BP monitor. Both are suppressed by profile flag, and neither suppression
+    /// may leak into the families that answer those commands fine.
+    func testR10MStartupOmitsChipSchemeAndTheBloodPressureMonitor() {
+        let sequence = encoder.startupSequence(
+            capabilities: YCBTCoordinator().capabilities.union([.bloodPressure]),
+            queryChipScheme: false,
+            supportsBloodPressureMonitor: false
+        ).map { Array($0.prefix(2)) }
+
+        XCTAssertFalse(sequence.contains([0x02, 0x1b]), "02 1b drops the R10M's link")
+        XCTAssertFalse(sequence.contains([0x01, 0x1c]), "the R10M has no all-day BP monitor")
+        XCTAssertEqual(sequence, [
+            [0x02, 0x00], [0x02, 0x01], [0x02, 0x07],
+            [0x01, 0x12], [0x01, 0x04],
+            [0x01, 0x0c],   // heart — baseline
+            [0x01, 0x26],   // SpO₂ — baseline
+            [0x01, 0x03], [0x03, 0x09],
+        ])
+    }
+
+    /// The TK5 / SmartHealth-Colmi path is unchanged: both flags stay true and all five monitors go out.
+    func testDefaultStartupStillSendsChipSchemeAndEveryMonitor() {
+        let sequence = encoder.startupSequence().map { Array($0.prefix(2)) }
+        XCTAssertTrue(sequence.contains([0x02, 0x1b]))
+        for monitor in [0x0c, 0x1c, 0x20, 0x26, 0x45] as [UInt8] {
+            XCTAssertTrue(sequence.contains([0x01, monitor]), "monitor 01 \(String(monitor, radix: 16)) missing")
+        }
+    }
+
+    /// A monitor names one sensor; a ring that lacks it answers `0xFC`. Filtering them out keeps a
+    /// rejection the user can't act on out of the middle of the handshake.
+    func testMonitorCommandsAreFilteredByCapability() {
+        let commands = encoder.monitorCommands(.allOnDefault, capabilities: [.heartRate, .spo2])
+            .map { Array($0.prefix(2)) }
+        XCTAssertEqual(commands, [[0x01, 0x0c], [0x01, 0x26]])
+    }
+
+    /// The BP monitor needs *both* the sensor capability and the family flag — the R10M has the sensor
+    /// and not the monitor, so the capability alone must not be enough.
+    func testBloodPressureMonitorNeedsTheFamilyFlagAsWellAsTheCapability() {
+        XCTAssertTrue(
+            encoder.monitorCommands(.allOnDefault, capabilities: [.bloodPressure])
+                .contains { Array($0.prefix(2)) == [0x01, 0x1c] }
+        )
+        XCTAssertFalse(
+            encoder.monitorCommands(
+                .allOnDefault, capabilities: [.bloodPressure], supportsBloodPressureMonitor: false
+            ).contains { Array($0.prefix(2)) == [0x01, 0x1c] }
+        )
     }
 
     // MARK: History commands

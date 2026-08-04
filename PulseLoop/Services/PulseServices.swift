@@ -79,7 +79,12 @@ enum MetricsService {
             metricStates: metricStates,
             calibration: calibration,
             goals: goals,
-            isDemo: isDemo
+            isDemo: isDemo,
+            // Consumed nutrition rides the summary only when the feature is on; nil otherwise so
+            // every consumer (tiles, cards, widgets, coach) inherits the master-toggle gate.
+            nutrition: NutritionPrefsStore.shared.prefs.masterEnabled
+                ? NutritionRepository.dayTotals(on: Date(), context: context)
+                : nil
         )
     }
     
@@ -534,7 +539,11 @@ enum MetricsService {
                 sleepHours: Double(goal.sleepMinutes) / 60,
                 exerciseDaysWeekly: goal.workoutsPerWeek,
                 distanceMetersDaily: goal.distanceMeters,
-                caloriesDaily: goal.calories
+                caloriesDaily: goal.calories,
+                intakeCalories: goal.intakeCalories,
+                intakeProteinG: goal.intakeProteinG,
+                intakeCarbsG: goal.intakeCarbsG,
+                intakeFatG: goal.intakeFatG
             )
         }
         return GoalsSummary(stepsDaily: 8000, activeMinutesDaily: 60, sleepHours: 7.5, exerciseDaysWeekly: 4, distanceMetersDaily: 8000, caloriesDaily: 500)
@@ -572,9 +581,12 @@ enum SleepService {
     
     static func sleepForDate(_ date: Date, context: ModelContext) -> SleepSummary? {
         let start = Calendar.current.startOfDay(for: date)
-        guard let session = SleepRepository.sessions(context: context).first(where: { Calendar.current.isDate($0.date, inSameDayAs: start) }) else {
-            return nil
-        }
+        // A day can now hold several sessions (night + naps). Surface the main sleep —
+        // the longest — so single-session callers (Today card) show the night, not a nap.
+        let session = SleepRepository.sessions(context: context)
+            .filter { Calendar.current.isDate($0.date, inSameDayAs: start) }
+            .max { $0.totalMinutes < $1.totalMinutes }
+        guard let session else { return nil }
         return summary(for: session, includeStages: true, context: context)
     }
     
@@ -698,6 +710,7 @@ enum SleepService {
 
         try? context.save()
     }
+
 }
 
 @MainActor

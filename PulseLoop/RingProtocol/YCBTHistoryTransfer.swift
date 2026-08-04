@@ -44,6 +44,9 @@ final class YCBTHistoryTransfer {
     private var buffer: [UInt8] = []
     /// A CRC mismatch buys the type exactly one re-request; a second failure gives up on it.
     private var retriedCurrentType = false
+    /// What the header promised, kept for the terminal block to be checked against. See `handleTerminal`.
+    private var expectedPackets = 0
+    private var expectedBytes = 0
     /// Types the firmware answered `0xFB`/`0xFC` for — never asked again this session.
     private var unsupported: Set<UInt8> = []
 
@@ -82,6 +85,29 @@ final class YCBTHistoryTransfer {
         publishOutOfBand(advance())
     }
 
+    /// Add types to the queue **without** disturbing whatever is in flight.
+    ///
+    /// `start` deliberately refuses while a transfer is running, which is right for a second full pass
+    /// but wrong for the one case this exists for: the ring's `02 01` capability bitmap arrives *during*
+    /// the startup history walk, and the types it unlocks would otherwise wait for the next sync. Appending
+    /// leaves the current type's buffer and terminal untouched — the new keys are simply asked for when
+    /// the queue reaches them.
+    ///
+    /// Duplicates are dropped rather than re-queued: asking twice would re-dump a log we already hold and
+    /// re-upsert every record in it. Idle is handled too, so a late bitmap after a finished walk still
+    /// pulls its types.
+    func append(types: [YCBTHistoryType]) {
+        let additions = types.filter { type in
+            !unsupported.contains(type.queryKey)
+                && !queue.contains(type)
+                && state.type != type
+        }
+        guard !additions.isEmpty else { return }
+        queue.append(contentsOf: additions)
+        guard !isActive else { return }
+        publishOutOfBand(advance())
+    }
+
     /// Abandon any in-flight transfer (disconnect / teardown).
     func cancel() {
         cancelWatchdog()
@@ -98,6 +124,8 @@ final class YCBTHistoryTransfer {
         buffer.removeAll(keepingCapacity: false)
         bufferCap = Self.defaultBufferCap
         retriedCurrentType = false
+        expectedPackets = 0
+        expectedBytes = 0
         guard !queue.isEmpty else {
             state = .idle
             return [.historySyncFinished]
@@ -147,6 +175,8 @@ final class YCBTHistoryTransfer {
     private func handleHeader(_ type: YCBTHistoryType, payload: [UInt8]) -> [RingDecodedEvent] {
         guard payload.count >= YCBTHealth.headerPayloadLength else { return advance() }
         let totalBytes = YCBTBytes.u32(payload, 6)
+        expectedPackets = YCBTBytes.u16(payload, 2)
+        expectedBytes = totalBytes
         buffer.removeAll(keepingCapacity: true)
         bufferCap = max(totalBytes, Self.defaultBufferCap)
         state = .receiving(type)
@@ -175,6 +205,23 @@ final class YCBTHistoryTransfer {
     private func handleTerminal(_ type: YCBTHistoryType, payload: [UInt8]) -> [RingDecodedEvent] {
         if case .requestSent = state, buffer.isEmpty { return [] }
         guard payload.count >= YCBTHealth.terminalPayloadLength else { return advance() }
+
+        // Count check before CRC, because the CRC alone does not catch a *short* buffer. A dropped data
+        // frame leaves us with fewer bytes than the ring sent, and the terminal's CRC was computed over
+        // what the ring sent — so it fails, which looks the same as corruption but isn't. Worse is the
+        // reverse: a transfer whose last frames never arrived can still terminate with a buffer whose CRC
+        // happens to be checked over exactly what we hold if the ring recomputed it. Cross-checking the
+        // packet and byte counts against *both* the header's promise and the buffer we actually built
+        // turns "silently short" into a NAK and a retry.
+        let packets = YCBTBytes.u16(payload, 0)
+        let bytes = YCBTBytes.u16(payload, 2)
+        let matchesHeader = packets == expectedPackets && bytes == expectedBytes
+        let matchesBuffer = bytes == buffer.count
+        guard matchesHeader, matchesBuffer else {
+            writer?.enqueue(Data(YCBTHealthCommand.historyBlockAck(status: YCBTHealth.ackCrcFailure)))
+            return retryOrSkip(type)
+        }
+
         let expected = UInt16(YCBTBytes.u16(payload, 4))
         let matches = YCBTFrame.crc16(buffer) == expected
 
@@ -227,11 +274,18 @@ final class YCBTHistoryTransfer {
         typeDeadline = nil
     }
 
+    /// Set by `YCBTSyncEngine`, which needs to see a completion it did not cause. `handle`'s events reach
+    /// the engine via the driver's return value; `start`, `append` and the watchdog have no such channel,
+    /// and the engine acts on `.historySyncFinished` (it re-issues the live-status subscription), so a
+    /// walk that the watchdog ended would otherwise leave today's steps stale until the next sync.
+    var onOutOfBandEvents: (([RingDecodedEvent]) -> Void)?
+
     /// `handle` returns its events to the driver, which publishes them. `start` and the watchdog have no
-    /// such return channel, so the one event they can produce — completion — is published here.
+    /// such return channel, so the one event they can produce — completion — is surfaced here.
     private func publishOutOfBand(_ events: [RingDecodedEvent]) {
         guard events.contains(where: { if case .historySyncFinished = $0 { return true } else { return false } })
         else { return }
+        onOutOfBandEvents?(events)
         Task { await PulseEventBus.shared.publish(.syncProgress(stage: "done")) }
     }
 }

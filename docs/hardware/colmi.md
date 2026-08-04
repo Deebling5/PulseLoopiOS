@@ -163,7 +163,8 @@ The VC30F is the PPG bio-sensor used in R10, R11, and R12:
 Some Colmi rings ship with **SmartHealth** (`com.zhuoting.healthyucheng`) instead of QRing: same brand,
 same product numbers, often the same box — but the firmware speaks the **Yucheng YCBT** protocol
 (`be940`), which has nothing in common at the wire level with QRing's Nordic-UART frames. It is the
-[TK5](tk5.md)'s protocol byte for byte, so these rings run the same shared driver.
+[TK5](tk5.md)'s and the [R10M](r10m.md)'s protocol byte for byte, so all three run the same shared
+driver.
 
 ### Which rings
 
@@ -254,4 +255,4 @@ The manufacturer publishes firmware update images with no authenticity checks �
 
 See the [hardware overview](index.md) for the full cross-manufacturer comparison
 tables, the [Jring / 56ff](jring.md) page for the cheaper option, or — if your Colmi came with the
-SmartHealth app — the [TK5](tk5.md) page, whose driver it shares.
+SmartHealth app — the [TK5](tk5.md) and [R10M](r10m.md) pages, whose driver it shares.

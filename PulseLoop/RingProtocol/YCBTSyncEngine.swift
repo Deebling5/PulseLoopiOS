@@ -17,6 +17,14 @@ final class YCBTSyncEngine: RingSyncEngine {
     private weak var writer: RingCommandWriter?
     private let encoder = YCBTEncoder()
     private let transfer: YCBTHistoryTransfer
+    private let profile: YCBTFamilyProfile
+
+    /// What this ring is believed to have — the family baseline until its `02 01` bitmap lands. Drives
+    /// which history types are worth asking for and which all-day monitors are worth writing.
+    private var historyCapabilities: Set<WearableCapability>
+
+    /// Set for the startup walk only, cleared when it finishes. See `handle(_:)`.
+    private var requestActivityAfterStartupHistory = false
 
     /// Every type `YCBTHealthRecords` can decode, in the SDK's own ascending-key sync order.
     ///
@@ -42,15 +50,22 @@ final class YCBTSyncEngine: RingSyncEngine {
     private var measurementSettings = MeasurementSettings.allOnDefault
     private var userProfile = UserProfileValues(metric: true, sex: nil, age: nil, heightCm: nil, weightKg: nil)
 
-    init(writer: RingCommandWriter?, transfer: YCBTHistoryTransfer) {
+    init(writer: RingCommandWriter?, transfer: YCBTHistoryTransfer, profile: YCBTFamilyProfile) {
         self.writer = writer
         self.transfer = transfer
+        self.profile = profile
+        self.historyCapabilities = profile.baselineCapabilities
+        // A walk the watchdog ends, or one `append` restarts from idle, produces its `.historySyncFinished`
+        // outside `handle`'s return path. Route it back in so the completion hook below fires either way.
+        transfer.onOutOfBandEvents = { [weak self] events in
+            events.forEach { self?.handle($0) }
+        }
     }
 
     // MARK: Startup
 
     func runStartup() {
-        for command in encoder.startupSequence(measurement: measurementSettings, profile: userProfile) {
+        for command in startupCommands() {
             writer?.enqueue(Data(command))
         }
         // The transfer machine writes the first `05 <type>` query itself and advances off the ring's
@@ -58,11 +73,103 @@ final class YCBTSyncEngine: RingSyncEngine {
         // `.activityUpdate` (a per-day max ratchet) and history measurements upsert by (kind, timestamp)
         // in `EventPersistenceSubscriber`, so a re-sync is already idempotent — and the reset case is a
         // documented no-op in the bus.
-        transfer.start(types: Self.historyTypes)
+        requestActivityAfterStartupHistory = true
+        transfer.start(types: supportedHistoryTypes(Self.historyTypes))
     }
 
-    /// History is protocol-driven now — nothing here advances it.
-    func handle(_ event: RingDecodedEvent) {}
+    private func startupCommands() -> [[UInt8]] {
+        encoder.startupSequence(
+            measurement: measurementSettings,
+            profile: userProfile,
+            capabilities: historyCapabilities,
+            queryChipScheme: profile.queryChipSchemeAtStartup,
+            supportsBloodPressureMonitor: profile.supportsBloodPressureMonitor
+        )
+    }
+
+    /// Two events need acting on; everything else the transfer machine handles itself.
+    func handle(_ event: RingDecodedEvent) {
+        switch event {
+        case let .supportFunctions(derived):
+            applySupportFunctions(derived)
+        case .historySyncFinished:
+            // Some R10M firmware ACKs the `03 09` live-status subscription sent during the handshake but
+            // doesn't actually start publishing until after its history dump is done — so today's step
+            // count sits at whatever the last session left until the user pulls to refresh. Asking once
+            // more, after the walk, costs one frame and fixes a reconnect that otherwise looks frozen.
+            guard requestActivityAfterStartupHistory else { return }
+            requestActivityAfterStartupHistory = false
+            writer?.enqueue(Data(encoder.enableLiveStatus()))
+        default:
+            return
+        }
+    }
+
+    /// The ring's own capability bitmap, which arrives mid-handshake — after the startup sequence has
+    /// already been queued from the baseline. Two things it can unlock:
+    ///
+    /// 1. **All-day monitors.** Only the *newly* permitted ones are pushed; re-sending a monitor already
+    ///    in the startup sequence would just re-write the same setting.
+    /// 2. **History types.** `append` rather than `start`, so the in-flight block is not disturbed.
+    private func applySupportFunctions(_ derived: Set<WearableCapability>) {
+        let refined = profile.refined(bitmapDerived: derived)
+        guard refined != historyCapabilities else { return }
+        let added = refined.subtracting(historyCapabilities)
+        historyCapabilities = refined
+
+        let alreadySent = encoder.monitorCommands(
+            measurementSettings,
+            capabilities: refined.subtracting(added),
+            supportsBloodPressureMonitor: profile.supportsBloodPressureMonitor
+        )
+        for command in encoder.monitorCommands(
+            measurementSettings,
+            capabilities: refined,
+            supportsBloodPressureMonitor: profile.supportsBloodPressureMonitor
+        ) where !alreadySent.contains(command) {
+            writer?.enqueue(Data(command))
+        }
+
+        var newTypes = supportedHistoryTypes(Self.historyTypes)
+        // The `05 09` combined record carries BP, HRV, temperature and blood sugar as *optional fields* of
+        // a record we always fetch — so unlike the others, a late unlock of one of these doesn't add a new
+        // query, it means the one we already ran was decoded with those fields dropped. Re-run it once.
+        if added.contains(where: { [.bloodPressure, .hrv, .temperature, .bloodSugar].contains($0) }) {
+            newTypes.append(.all)
+        }
+        transfer.append(types: newTypes)
+    }
+
+    /// Ask only for logs this ring is believed to keep.
+    ///
+    /// A ring that doesn't implement a type answers with a no-data header or a `0xFC`, both of which
+    /// `YCBTHistoryTransfer` handles — so this is not about correctness, it is about not spending ten
+    /// seconds of watchdog per absent type on every sync. `.all` is never gated: the combined record is
+    /// the fallback source for half these metrics, and no bit names it.
+    private func supportedHistoryTypes(_ types: [YCBTHistoryType]) -> [YCBTHistoryType] {
+        types.filter { type in
+            switch type {
+            case .sport: return historyCapabilities.contains(.steps)
+            case .sleep: return historyCapabilities.contains(.sleep)
+            case .heart: return historyCapabilities.contains(.heartRate)
+            case .blood: return historyCapabilities.contains(.bloodPressure)
+            case .all: return true
+            // Not `.spo2` — this is the dedicated `05 1a` all-day log, which a ring can lack while still
+            // reporting SpO₂ in the combined record. The R10M is exactly that ring.
+            case .spo2: return historyCapabilities.contains(.spo2History)
+            case .temperature: return historyCapabilities.contains(.temperature)
+            case .comprehensive: return historyCapabilities.contains(.bloodSugar)
+            case .bodyData:
+                return historyCapabilities.contains(.hrv)
+                    || historyCapabilities.contains(.stress)
+                    || historyCapabilities.contains(.fatigue)
+            // `YCBTHistoryType` is a struct of static members, not an enum, so the compiler can't check
+            // this for exhaustiveness — every member of `YCBTHistoryType.catalog` is named above, and a
+            // new one has to declare its gate here before it will ever be requested.
+            default: return false
+            }
+        }
+    }
 
     // MARK: History passes
     //
@@ -72,14 +179,18 @@ final class YCBTSyncEngine: RingSyncEngine {
     /// Re-run the full queue without re-sending the connect handshake. Driven by `RingSyncCoordinator`'s
     /// 30-minute periodic pass (SmartHealth's own cadence) while connected.
     func syncHistory() {
-        transfer.start(types: Self.historyTypes)
+        // Re-assert the live-status subscription first. Pull-to-refresh is the gesture a user makes
+        // *because* today's steps look stale, and on a ring whose `03 09` went quiet the history walk
+        // alone won't move them — the cumulative counter comes from the `06 00` stream, not the logs.
+        writer?.enqueue(Data(encoder.enableLiveStatus()))
+        transfer.start(types: supportedHistoryTypes(Self.historyTypes))
     }
 
     /// Post-workout backfill: pull just the vitals logs so samples the ring recorded while the phone was
     /// away or suspended land in the session that just finished (`ActivityRecorderService.linkSample`
     /// windows them in).
     func syncVitalsHistory() {
-        transfer.start(types: Self.vitalsTypes)
+        transfer.start(types: supportedHistoryTypes(Self.vitalsTypes))
     }
 
     // MARK: All-day measurement config (the five `01 xx {enable, interval}` monitors)
@@ -92,7 +203,11 @@ final class YCBTSyncEngine: RingSyncEngine {
     /// Store *and* push immediately — the live "Save" path while connected.
     func applyMeasurementSettings(_ settings: MeasurementSettings) {
         measurementSettings = settings
-        for command in encoder.monitorCommands(settings) {
+        for command in encoder.monitorCommands(
+            settings,
+            capabilities: historyCapabilities,
+            supportsBloodPressureMonitor: profile.supportsBloodPressureMonitor
+        ) {
             writer?.enqueue(Data(command))
         }
     }

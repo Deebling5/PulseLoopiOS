@@ -79,7 +79,11 @@ struct YCBTDecoder {
             // Cumulative day totals. steps verified against capture (0x027b = 635); distance/calories
             // are the adjacent u16s — UNVERIFIED (capture-inferred), but `applyActivityUpdate` uses
             // max() so an over-read can't corrupt the day.
-            guard p.count >= 2 else { return [.commandAck(commandId: frame.cmd)] }
+            //
+            // All three fields or none. `YCBTBytes.u16` returns 0 past the end of the buffer, so a short
+            // frame decoded as a *valid* activity row with zeroed distance and calories — the ratchet
+            // keeps the totals safe, but the row itself asserts the ring reported a zero it never sent.
+            guard p.count >= 6 else { return [.commandAck(commandId: frame.cmd)] }
             return [.activityUpdate(timestamp: now, steps: YCBTBytes.u16(p, 0),
                                     distanceMeters: Double(YCBTBytes.u16(p, 2)),
                                     calories: Double(YCBTBytes.u16(p, 4)))]

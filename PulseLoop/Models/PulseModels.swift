@@ -425,6 +425,18 @@ final class UserProfile {
     var hasKnownLungCondition: Bool?
     /// Preferred glucose display unit.
     var preferredGlucoseUnitRaw: String = GlucoseUnit.mgdl.rawValue
+    /// How resting-HR zone boundaries are chosen (standard / auto / custom). Defaulted for the same
+    /// additive lightweight-migration reason as the fields above.
+    var hrZoneModeRaw: String = HRZoneMode.auto.rawValue
+    /// Learned resting HR (p10 of ~30 days), written by `RestingHRBaselineService` once established.
+    var hrRestingBaseline: Double?
+    /// When the baseline was last recomputed (throttles the refresh; set even when not established).
+    var hrRestingBaselineUpdatedAt: Date?
+    // Custom HR zone boundaries; only read when `hrZoneMode == .custom`.
+    var hrCustomLowUpper: Double?
+    var hrCustomAthleticUpper: Double?
+    var hrCustomElevatedStart: Double?
+    var hrCustomHighStart: Double?
 
     var units: UnitsPreference {
         get { UnitsPreference(rawValue: unitsRaw) ?? .metric }
@@ -434,6 +446,11 @@ final class UserProfile {
     var preferredGlucoseUnit: GlucoseUnit {
         get { GlucoseUnit(rawValue: preferredGlucoseUnitRaw) ?? .mgdl }
         set { preferredGlucoseUnitRaw = newValue.rawValue }
+    }
+
+    var hrZoneMode: HRZoneMode {
+        get { HRZoneMode(rawValue: hrZoneModeRaw) ?? .auto }
+        set { hrZoneModeRaw = newValue.rawValue }
     }
 
     init(
@@ -481,8 +498,16 @@ final class UserGoal {
     /// Daily distance goal in canonical metres (converted to km/mi for display, like all stored distance).
     /// Defaulted so this is a safe additive SwiftData migration for existing rows.
     var distanceMeters: Double = 8000
-    /// Daily active-energy goal in kcal. Defaulted for the same additive-migration reason.
+    /// Daily active-energy *burn* goal in kcal (not intake — that's `intakeCalories`).
+    /// Defaulted for the same additive-migration reason.
     var calories: Int = 500
+    // Daily nutrition *intake* goals. Optional with nil defaults: additive lightweight migration,
+    // and nil means "not set" — the app must never invent a calorie target for the user.
+    /// Daily calorie intake goal in kcal — distinct from `calories`, the active-energy burn goal.
+    var intakeCalories: Int?
+    var intakeProteinG: Int?
+    var intakeCarbsG: Int?
+    var intakeFatG: Int?
     var updatedAt: Date
 
     init(id: UUID = UUID(), steps: Int = 10000, sleepMinutes: Int = 480, activeMinutes: Int = 45, workoutsPerWeek: Int = 4, distanceMeters: Double = 8000, calories: Int = 500) {
@@ -565,6 +590,8 @@ final class ActivitySession {
     // How workout HR was captured: "stream" (continuous live HR stream) or "spot" (timer-driven
     // one-shot reads). Defaulted so the migration stays additive.
     var vitalsModeRaw: String = "spot"
+    // Strava activity id once uploaded; nil = never uploaded. Defaulted so the migration stays additive.
+    var stravaActivityId: String? = nil
 
     init(
         id: UUID = UUID(),
@@ -799,6 +826,10 @@ final class CoachMessage {
     /// produced this message. Drives the in-chat workout card. Optional with a
     /// default keeps the SwiftData migration lightweight.
     var loggedActivityIdsJSON: String? = nil
+    /// Encoded `[UUID]` of meal entries logged/edited by the turn that produced
+    /// this message. Drives the in-chat meal card. Optional with a default keeps
+    /// the SwiftData migration lightweight.
+    var loggedMealIdsJSON: String? = nil
     var createdAt: Date
 
     init(
@@ -806,7 +837,8 @@ final class CoachMessage {
         pendingActionJSON: String? = nil, attachmentsJSON: String? = nil,
         inputTokens: Int? = nil, outputTokens: Int? = nil, costUSD: Double? = nil,
         modelUsed: String? = nil, providerUsed: String? = nil,
-        loggedActivityIdsJSON: String? = nil, createdAt: Date = Date()
+        loggedActivityIdsJSON: String? = nil, loggedMealIdsJSON: String? = nil,
+        createdAt: Date = Date()
     ) {
         self.id = id
         self.conversationId = conversationId
@@ -821,6 +853,7 @@ final class CoachMessage {
         self.modelUsed = modelUsed
         self.providerUsed = providerUsed
         self.loggedActivityIdsJSON = loggedActivityIdsJSON
+        self.loggedMealIdsJSON = loggedMealIdsJSON
         self.createdAt = createdAt
     }
 }

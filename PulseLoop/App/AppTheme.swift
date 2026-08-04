@@ -19,11 +19,16 @@ enum AppRoute: Hashable {
     case settingsActivityTracking
     case settingsGoals
     case settingsVitals
+    case settingsHeartRateZones
     case settingsToday
     case settingsCalibration
     case settingsHealth
+    case settingsStrava
     case settingsPrivacyData
     case settingsAbout
+    case settingsNutrition
+    case nutrition
+    case mealDetail(UUID)
     case pairing
     case debug
     case componentGallery
@@ -78,6 +83,11 @@ enum PulseColors {
     static let stress = Color(hex: "#FF8A4C")
     static let hrv = Color(hex: "#9D7CFF")
     static let temperature = Color(hex: "#2DD4D8")
+    // Nutrition macros (intake energy reuses `calories`). Hues picked to be CVD-separable from
+    // each other and from the kcal orange in macro bars/pills.
+    static let macroProtein = Color(hex: "#4DA3FF")   // blue
+    static let macroCarbs = Color(hex: "#35E0A1")     // mint
+    static let macroFat = Color(hex: "#FFD166")       // gold
     // jring/56ff metrics
     static let bloodPressure = Color(hex: "#FF6B9D")
     static let bloodSugar = Color(hex: "#FFB84D")
@@ -91,9 +101,19 @@ enum PulseColors {
     static let zoneSoftAmber = Color(hex: "#FFD9A0") // slight caution (distinct from amber)
     static let zoneOrange = Color(hex: "#FF8A4C")   // elevated / low-oxygen / stage 1
     static let zoneRed = Color(hex: "#FF4D6D")      // high / critical
-    static let zoneCritical = Color(hex: "#FF1744") // brighter/deeper red for HR high vs the HR accent
+    static let zoneCritical = Color(hex: "#FF1744") // no longer used by HR (too close to the HR accent); kept for snapshot decode compat
+    static let zoneDeepRed = Color(hex: "#B3261E")  // HR high — dark red, CVD-safe separation from the pink-red HR accent
     static let borderSubtle = Color.white.opacity(0.08)
     static let borderStrong = Color.white.opacity(0.16)
+}
+
+/// Corner-radius tokens so peer glass surfaces share one radius instead of the
+/// ad-hoc 16/18/20/22/24 mix. `card` for standard glass cards, `compact` for
+/// smaller/inset surfaces, `control` for buttons and small controls.
+enum PulseRadius {
+    static let card: CGFloat = 20
+    static let compact: CGFloat = 16
+    static let control: CGFloat = 12
 }
 
 extension Color {

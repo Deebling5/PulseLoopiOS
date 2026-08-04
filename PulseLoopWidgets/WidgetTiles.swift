@@ -116,6 +116,76 @@ struct WidgetActivityContent: View {
     }
 }
 
+// MARK: - Nutrition (kcal headline + macro "fuel bar", from `NutritionTileView`)
+
+struct WidgetNutritionContent: View {
+    let payload: WidgetNutritionPayload?
+    let rolledOver: Bool
+
+    private var active: WidgetNutritionPayload? { rolledOver ? nil : payload }
+
+    /// Proportional macro split, mirroring the in-app tile's fuel bar.
+    private func fuelSegments(_ payload: WidgetNutritionPayload) -> [SleepStageSegment] {
+        payload.macroRows
+            .filter { $0.value > 0 }
+            .map { SleepStageSegment(minutes: $0.value, color: Color(hex: $0.colorHex), label: $0.letter) }
+    }
+
+    var body: some View {
+        if let payload = active, payload.kcal > 0 {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(alignment: .firstTextBaseline, spacing: 5) {
+                    Text(payload.centerText)
+                        .font(.system(size: 30, weight: .semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(payload.kcalGoal > 0 && payload.kcal > payload.kcalGoal
+                                         ? Color(hex: payload.ringColorHex) : PulseColors.textPrimary)
+                        .minimumScaleFactor(0.7)
+                        .lineLimit(1)
+                    Text(payload.centerLabel)
+                        .font(.system(size: 10, weight: .semibold))
+                        .tracking(1.0)
+                        .foregroundStyle(PulseColors.textMuted)
+                }
+                let segments = fuelSegments(payload)
+                if segments.isEmpty {
+                    Capsule().fill(PulseColors.elevated).frame(height: 12)
+                } else {
+                    SleepStageBar(segments: segments)
+                        .frame(height: 28)
+                }
+                // Single compact stat line, matching the in-app tile (no wrap at small size).
+                HStack(alignment: .firstTextBaseline, spacing: 4) {
+                    Text("\(Int(payload.kcal.rounded()).formatted())")
+                        .font(.system(size: 13, weight: .semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(PulseColors.textPrimary)
+                    Text("EATEN")
+                        .font(.system(size: 9, weight: .semibold)).tracking(0.8)
+                        .foregroundStyle(PulseColors.calories)
+                    if payload.kcalGoal > 0 {
+                        Spacer(minLength: 4)
+                        Text("\(Int(payload.kcalGoal.rounded()).formatted())")
+                            .font(.system(size: 13, weight: .semibold))
+                            .monospacedDigit()
+                            .foregroundStyle(PulseColors.textSecondary)
+                        Text("GOAL")
+                            .font(.system(size: 9, weight: .semibold)).tracking(0.8)
+                            .foregroundStyle(PulseColors.textMuted)
+                    }
+                }
+                .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        } else {
+            WidgetEmptyMessage(systemImage: "fork.knife",
+                               message: rolledOver || (active?.kcal == 0) ? "No meals yet today"
+                                   : (payload == nil ? "Enable nutrition in PulseLoop" : "Open PulseLoop to sync"),
+                               color: PulseColors.calories)
+        }
+    }
+}
+
 // MARK: - Activity (full-width: labeled metrics left, big rings right, from `DailyActivitySummaryCard`)
 
 struct WidgetActivityFullContent: View {
@@ -347,6 +417,8 @@ struct WidgetMetricTileView: View {
         switch metric.tileStyle {
         case .rings:
             WidgetActivityContent(payload: entry.snapshot?.activity, rolledOver: entry.rolledOver)
+        case .nutrition:
+            WidgetNutritionContent(payload: entry.snapshot?.nutrition, rolledOver: entry.rolledOver)
         case .sleep:
             WidgetSleepContent(payload: entry.snapshot?.sleep, rolledOver: entry.rolledOver)
         case .chart, .gauge, .bloodPressure:

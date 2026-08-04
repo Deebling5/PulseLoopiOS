@@ -23,8 +23,11 @@ struct AboutSettingsView: View {
     private let repoURL = URL(string: "https://github.com/saksham2001/PulseLoopiOS")!
     private let discordURL = URL(string: "https://discord.gg/t9y85ebaKD")!
 
+    /// Read from the bundle rather than hardcoded, so this row can't drift from the shipped build.
     private var appVersionLabel: String {
-        "v1.0.0-beta.2"
+        let short = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "—"
+        return "v\(short) (\(build))"
     }
 
     var body: some View {

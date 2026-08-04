@@ -28,14 +28,24 @@ final class RingBLEClient: NSObject {
     /// Registry of supported wearables. First coordinator whose `matches` claims a peripheral wins.
     /// **Adding a wearable = append one entry here.**
     ///
-    /// The order is load-bearing at exactly one place: `ColmiSmartHealthCoordinator` must precede
-    /// `ColmiCoordinator`. Both recognize the same Colmi local names, and the QRing matcher needs
-    /// *only* the name — so behind it, no SmartHealth ring would ever be claimed. The SmartHealth
-    /// matcher is a conjunction a QRing ring cannot satisfy, so it is safe in front.
+    /// The order is load-bearing at exactly two places:
+    ///   • `ColmiSmartHealthCoordinator` must precede `ColmiCoordinator`. Both recognize the same Colmi
+    ///     local names, and the QRing matcher needs *only* the name — so behind it, no SmartHealth ring
+    ///     would ever be claimed. The SmartHealth matcher is a conjunction a QRing ring cannot satisfy.
+    ///   • `LuckRingCoordinator` must precede `TK5Coordinator`. LuckRing matches strong, family-exclusive
+    ///     signals (the `F618` service, the `0xFF64` company ID) that no other coordinator claims; ordering
+    ///     it ahead of TK5 is defensive, so TK5's weak `TK5`-name prefix could never shadow a hypothetical
+    ///     `TK5x`-named LuckRing sibling. ("TK18" does not hit the `TK5` prefix, so today it is moot.)
     static let coordinators: [WearableCoordinator.Type] = [
         JringCoordinator.self,
+        // Ahead of both Colmi coordinators: `ColmiSmartHealthCoordinator`'s `<MODEL> <4 hex>` name
+        // convention accepts "R10M FCF4", so an R10M carrying the shared `1078` company ID would
+        // otherwise be claimed as a Colmi and handed the Colmi baseline. This coordinator's own matcher
+        // is narrow enough (see there) that leading the Colmis costs them nothing.
+        YCBTCoordinator.self,
         ColmiSmartHealthCoordinator.self,
         ColmiCoordinator.self,
+        LuckRingCoordinator.self,
         TK5Coordinator.self,
     ]
 
@@ -101,6 +111,10 @@ final class RingBLEClient: NSObject {
     /// Optional second write characteristic for big-data requests (Colmi `de5bf72a`).
     private var commandChar: CBCharacteristic?
     private var notifyChars: [CBUUID: CBCharacteristic] = [:]
+    /// Notify characteristics that have actually reported `isNotifying` on *this* link. Reset per
+    /// connection: a driver survives a reconnect, so a set carried over would let the next link claim
+    /// readiness on subscriptions that belong to the dead one.
+    private var subscribedNotifyUUIDs: Set<CBUUID> = []
     private var batteryCharacteristic: CBCharacteristic?
 
     // MARK: Active driver / engine (selected per connection)
@@ -292,6 +306,19 @@ final class RingBLEClient: NSObject {
         pumpWrites()
     }
 
+    /// Put commands at the **head** of the write queue, preserving their order relative to each other.
+    ///
+    /// Only for `WearableDriver.immediatePostSubscriptionCommands()`. Everything else must append: the
+    /// queue is what makes writes serial and ordered, and a caller jumping it would reorder a protocol
+    /// that depends on its own sequence.
+    private func prependWrites(_ commands: [Data]) {
+        let framed = commands.map { command -> (data: Data, useCommandChannel: Bool) in
+            let framed = activeDriver?.frame(command) ?? command
+            return (data: framed, useCommandChannel: activeDriver?.usesCommandChannel(for: framed) ?? false)
+        }
+        writeQueue.insert(contentsOf: framed, at: 0)
+    }
+
     func readBattery() {
         guard let peripheral, let batteryCharacteristic else { return }
         peripheral.readValue(for: batteryCharacteristic)
@@ -353,6 +380,7 @@ final class RingBLEClient: NSObject {
             central.cancelPeripheralConnection(old)
         }
         writeChar = nil; commandChar = nil; notifyChars = [:]; batteryCharacteristic = nil
+        subscribedNotifyUUIDs = []
         writeInFlight = false; writeQueue = []
         peripheral = target
         target.delegate = self
@@ -435,10 +463,32 @@ final class RingBLEClient: NSObject {
               let peripheral,
               let writeChar,
               !writeQueue.isEmpty else { return }
-        let item = writeQueue.removeFirst()
         // Big-data requests go to the command char (`de5bf72a`); fall back to the write char if the
         // device/firmware didn't expose a separate one.
-        let target = (item.useCommandChannel ? commandChar : writeChar) ?? writeChar
+        let target = (writeQueue[0].useCommandChannel ? commandChar : writeChar) ?? writeChar
+
+        // The write type must come from the characteristic, not a constant. A characteristic that only
+        // supports write-without-response (the TK18's `B002`) silently *discards* a `.withResponse`
+        // write — CoreBluetooth never calls `didWriteValueFor`, so every packet used to sit out the
+        // full missed-ACK timeout and the device never received a byte. This mirrors Android's
+        // `writeCharacteristic`, which auto-selects the type from the properties.
+        let type: CBCharacteristicWriteType =
+            target.properties.contains(.write) ? .withResponse : .withoutResponse
+
+        if type == .withoutResponse {
+            // No ATT round-trip to serialize on; pace with the peripheral's buffer instead.
+            // `peripheralIsReady(toSendWriteWithoutResponse:)` re-pumps when it drains.
+            guard peripheral.canSendWriteWithoutResponse else { return }
+            let item = writeQueue.removeFirst()
+            publishRawPacket(direction: .outgoing, data: item.data)
+            // Deliberately no `noteActivity()`: an unacknowledged write proves nothing about the link,
+            // and crediting it would blind the watchdog to a zombie connection during a silent sync.
+            peripheral.writeValue(item.data, for: target, type: .withoutResponse)
+            pumpWrites()
+            return
+        }
+
+        let item = writeQueue.removeFirst()
         writeInFlight = true
         writeSeq &+= 1
         let seq = writeSeq
@@ -705,6 +755,7 @@ extension RingBLEClient: CBCentralManagerDelegate {
             writeChar = nil
             commandChar = nil
             notifyChars = [:]
+            subscribedNotifyUUIDs = []
             batteryCharacteristic = nil
             writeInFlight = false
             writeQueue = []
@@ -790,8 +841,12 @@ extension RingBLEClient: CBPeripheralDelegate {
             guard let driver = activeDriver,
                   driver.notifyUUIDs.contains(characteristic.uuid),
                   characteristic.isNotifying else { return }
-            // Fully connected once at least one notify char is live. (Multi-notify devices may fire
-            // this twice; guard against re-running startup.)
+            subscribedNotifyUUIDs.insert(characteristic.uuid)
+            // Fully connected once every channel the driver declared *required* is live — or, for a
+            // driver that declares none, on the first one, which is the historical behaviour. (Multi-notify
+            // devices fire this once per channel; guard against re-running startup.)
+            let required = driver.requiredSubscriptionsBeforeConnected
+            guard required.allSatisfy(subscribedNotifyUUIDs.contains) else { return }
             guard state != .connected else { return }
             state = .connected
             cancelConnectTimeout()   // the attempt landed
@@ -817,6 +872,10 @@ extension RingBLEClient: CBPeripheralDelegate {
             startKeepalive()
             startWatchdog()
             readBattery()
+            // Order on the wire: the driver's own handshake, then the engine's startup sequence.
+            // `onConnected` is what queues the latter, so the prepend has to happen first — after it, the
+            // engine's commands are already in the queue and "head" would mean jumping them too.
+            prependWrites(driver.immediatePostSubscriptionCommands())
             onConnected?()
             pumpWrites()
         }
@@ -868,6 +927,14 @@ extension RingBLEClient: CBPeripheralDelegate {
         MainActor.assumeIsolated {
             noteActivity()
             writeInFlight = false
+            pumpWrites()
+        }
+    }
+
+    /// The without-response buffer drained — resume the queue. (Writes gated on
+    /// `canSendWriteWithoutResponse` park here when the peripheral's buffer is full.)
+    nonisolated func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
+        MainActor.assumeIsolated {
             pumpWrites()
         }
     }

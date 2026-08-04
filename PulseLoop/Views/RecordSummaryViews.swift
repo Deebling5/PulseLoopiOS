@@ -64,6 +64,7 @@ struct RecordSummaryView: View {
     @State private var note = ""
     /// Debounce for the backfill-driven summary refresh (samples arrive in bursts after finish).
     @State private var refreshTask: Task<Void, Never>?
+    @State private var presentingShare = false
 
     private let efforts: [(String, String)] = [("easy", "Easy"), ("moderate", "Moderate"), ("hard", "Hard"), ("very_hard", "Very hard")]
 
@@ -92,6 +93,9 @@ struct RecordSummaryView: View {
 
                     effortCard
 
+                    // Same position semantics as ActivityDetailView: after the notes/effort content.
+                    StravaUploadRow(session: session)
+
                     Spacer(minLength: 8)
                 }
                 .padding(16)
@@ -100,8 +104,15 @@ struct RecordSummaryView: View {
             .background(PulseColors.background)
             .navigationBarBackButtonHidden(true)
             .safeAreaInset(edge: .bottom) {
-                PrimaryButton(title: "Done", systemImage: "checkmark") { done(session) }
-                    .padding(16)
+                HStack(spacing: 12) {
+                    SecondaryButton(title: "Share", systemImage: "square.and.arrow.up") { presentingShare = true }
+                        .frame(width: 130)
+                    PrimaryButton(title: "Done", systemImage: "checkmark") { done(session) }
+                }
+                .padding(16)
+            }
+            .sheet(isPresented: $presentingShare) {
+                ShareCardSheet(session: session)
             }
             .onAppear { effort = session.perceivedEffort; note = session.notes ?? "" }
             .onChange(of: samples.count) { _, _ in
@@ -132,7 +143,24 @@ struct RecordSummaryView: View {
                             .font(PulseFont.footnote)
                             .foregroundStyle(active ? PulseColors.textPrimary : PulseColors.textSecondary)
                             .padding(.horizontal, 12).padding(.vertical, 8)
-                            .pulseGlass(Capsule(), interactive: true, tint: active ? PulseColors.accent : nil)
+                            // Solid tile, not glass: these pills sit inside the effort card's
+                            // own glass, and glass can't sample glass (renders flat). Selected
+                            // keeps the accent as a solid fill; unselected gets a subtle white
+                            // sheen + hairline.
+                            .background {
+                                if active {
+                                    Capsule().fill(PulseColors.accent)
+                                } else {
+                                    Capsule()
+                                        .fill(
+                                            LinearGradient(
+                                                colors: [Color.white.opacity(0.16), Color.white.opacity(0.07)],
+                                                startPoint: .top, endPoint: .bottom
+                                            )
+                                        )
+                                        .overlay(Capsule().strokeBorder(.white.opacity(0.12), lineWidth: 0.5))
+                                }
+                            }
                     }
                     .buttonStyle(.plain)
                 }
@@ -141,7 +169,14 @@ struct RecordSummaryView: View {
                 .lineLimit(2...4)
                 .font(PulseFont.subheadline.weight(.regular))
                 .padding(12)
-                .pulseGlass(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                // Solid field background, not glass: this input sits inside the effort card's
+                // glass (glass can't sample glass → flat). A soft fill + hairline gives it a
+                // visible input affordance.
+                .background(PulseColors.cardSoft, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .strokeBorder(.white.opacity(0.12), lineWidth: 0.5)
+                )
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(16)

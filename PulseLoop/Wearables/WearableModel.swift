@@ -53,7 +53,7 @@ enum RingAppVariant: String, CaseIterable, Identifiable, Sendable {
         switch family {
         case .colmiR02: self = .qring
         case .colmiSmartHealth: self = .smartHealth
-        case .jring, .tk5: return nil
+        case .jring, .tk5, .luckRing, .ycbt: return nil
         }
     }
 
@@ -108,11 +108,15 @@ extension RingDeviceType {
     /// How proven this family's driver is. Exhaustive on purpose: a new family must state its level.
     var supportLevel: WearableSupportLevel {
         switch self {
-        case .jring, .colmiR02: return .full
-        // Both YCBT families are unproven on hardware. The SmartHealth-Colmi has never been connected
-        // at all — its advertisement, its capability bitmap and its history types are all still
-        // predictions (plan B6 is what settles them).
-        case .tk5, .colmiSmartHealth: return .limited
+        case .jring, .colmiR02, .colmiSmartHealth: return .full
+        // The TK5 is unproven on hardware — its advertisement, capability bitmap and history types
+        // are still predictions.
+        case .tk5: return .limited
+        // TK18 is the only hardware-tested LuckRing; every 0xFF64 sibling is still a prediction.
+        case .luckRing: return .limited
+        // Validated end-to-end on an R10M FCF4 running firmware 2.32 — pairing, handshake, reconnect,
+        // activity and history sync, HR/SpO₂/BP, battery, sleep stages and REM.
+        case .ycbt: return .full
         }
     }
 }
@@ -171,6 +175,32 @@ extension WearableModel {
         id: "tk5", displayName: "TK5", brand: "TK", family: .tk5,
         tint: PulseColors.spo2, blurb: "HR · SpO₂ · HRV · Sleep · Steps",
         advertisedNamePatterns: ["^TK5 ?[0-9A-Fa-f]{0,4}$"], imageName: "tk5"
+    )
+
+    /// R10M — sold as the "LittleMeatball" smart ring, and the hardware-validated unit of the generic
+    /// `.ycbt` family (FCF4, firmware 2.32). It speaks the same YCBT protocol as the TK5 and the
+    /// SmartHealth-flavoured Colmis, but it is **not** a Colmi ring, so it carries its own product art and
+    /// its own capability set rather than borrowing theirs.
+    ///
+    /// The pattern accepts both separators (`R10M FCF4` and `R10M_FCF4`) because both forms have been
+    /// observed. It is deliberately narrower than `YCBTCoordinator`'s own name check: this one is
+    /// user-facing identity, and mis-labelling a ring is worse than showing it un-named.
+    ///
+    /// Blurb mirrors `YCBTCoordinator`'s baseline plus the BP its bitmap grants — BP, temperature, HRV,
+    /// stress and blood sugar are all claimed from the ring's own `02 01` reply at connect time.
+    static let r10m = WearableModel(
+        id: "r10m", displayName: "R10M (LittleMeatball)", brand: "LittleMeatball", family: .ycbt,
+        tint: PulseColors.hrv, blurb: "HR · SpO₂ · BP · Sleep",
+        advertisedNamePatterns: ["^R10M[ _][0-9A-F]{4}$"], imageName: "r10m"
+    )
+
+    // TK18 — the LuckRing app / "K6" protocol (company ID 0xFF64). The only hardware-tested unit of the
+    // whole 0xFF64 family, so it is `.limited`. Its baseline is what the driver can decode; untested
+    // siblings still pair via the coordinator's strong-signal match and get generic art + a fallback name.
+    static let luckRingTK18 = WearableModel(
+        id: "luckring-tk18", displayName: "TK18", brand: "LuckRing", family: .luckRing,
+        tint: PulseColors.accent, blurb: "HR · SpO₂ · HRV · Temp · BP · Sleep · Steps",
+        advertisedNamePatterns: ["^TK18([ _-].*)?$"], imageName: "luckring-tk18"
     )
 
     // Yawell-branded variants of the same hardware.
@@ -300,7 +330,11 @@ extension WearableModel {
         colmiR02, colmiR03, colmiR06, colmiR07, colmiR08, colmiR09, colmiR10, colmiR11, colmiR12,
         colmiR99,
         yawellR05, yawellR10, yawellR11, h59,
+        // Ahead of the YCBT siblings: `model(advertisedName:)` takes the first pattern that matches, and
+        // R10M is the narrowest of the three.
+        r10m,
         tk5,
+        luckRingTK18,
     ]
 
     static func model(id: String?) -> WearableModel? {

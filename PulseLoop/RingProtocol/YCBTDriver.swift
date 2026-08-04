@@ -1,6 +1,30 @@
 import Foundation
 @preconcurrency import CoreBluetooth
 
+/// The handful of facts that differ between the ring families sharing this driver. Everything else about
+/// the YCBT stack is protocol, identical for all of them.
+///
+/// The two `Bool`s are firmware quirks, not preferences — both default to the permissive value so an
+/// existing family keeps its behaviour, and only the R10M turns them off.
+struct YCBTFamilyProfile {
+    /// Unconditional promises from the coordinator. The ring's own bitmap can never take one back.
+    let baselineCapabilities: Set<WearableCapability>
+    /// Capabilities the coordinator will grant *if* the ring's `02 01` reply claims them.
+    let bitmapGatedCapabilities: Set<WearableCapability>
+    /// Send the informational `02 1b` GetChipScheme during startup. The R10M closes an otherwise healthy
+    /// connection with HCI `0x13` when asked.
+    var queryChipSchemeAtStartup: Bool = true
+    /// Send the all-day blood-pressure monitor `01 1c`. The R10M does not implement it even when its
+    /// bitmap declares the BP sensor, so the flag is separate from the `.bloodPressure` capability.
+    var supportsBloodPressureMonitor: Bool = true
+
+    /// The additive refinement, identical in rule to `WearableCoordinator.refinedCapabilities` — the
+    /// driver needs its own copy because it filters decoded events before the client ever sees them.
+    func refined(bitmapDerived: Set<WearableCapability>) -> Set<WearableCapability> {
+        baselineCapabilities.union(bitmapGatedCapabilities.intersection(bitmapDerived))
+    }
+}
+
 /// YCBT driver. Owns the length-prefixed CRC16 framing and the split-channel topology: the command
 /// characteristic `be940001` is *both* the write target and a notify source (command replies), while
 /// `be940003` carries the async live/history stream. The standard `180D`/`2A37` Heart Rate
@@ -52,8 +76,19 @@ final class YCBTDriver: WearableDriver {
     /// entries are then the stale ones, and dropping them keeps the newest command pairable.
     private static let maxPendingMeasurementReplies = 8
 
-    init(writer: RingCommandWriter) {
+    /// The family this connection is serving — capability sets plus the two firmware quirks.
+    private let profile: YCBTFamilyProfile
+    private let encoder = YCBTEncoder()
+
+    /// What this ring is currently believed to have: the family baseline until its `02 01` reply lands,
+    /// then the additive refinement. Reset on every connect and disconnect, because the answer belongs to
+    /// one link — a reconnect to a *different* ring of the same family must not inherit it.
+    private var capabilities: Set<WearableCapability>
+
+    init(writer: RingCommandWriter, profile: YCBTFamilyProfile) {
         self.writer = writer
+        self.profile = profile
+        self.capabilities = profile.baselineCapabilities
         self.transfer = YCBTHistoryTransfer(writer: writer)
     }
 
@@ -72,6 +107,23 @@ final class YCBTDriver: WearableDriver {
     ]
     let batteryServiceUUID: CBUUID? = nil   // battery is in-band (GetDeviceInfo 02 00, payload[5])
     let batteryCharUUID: CBUUID? = nil
+
+    /// **Both** channels must be live before the connection counts as up. They are not redundant: command
+    /// replies (the whole handshake — device info, the capability bitmap, every ACK) arrive on `be940001`,
+    /// while the live and history streams arrive on `be940003`. Publishing `.connected` on whichever
+    /// subscribed first — which is what a driver that declares nothing here gets — starts the handshake
+    /// against a half-subscribed ring, and whichever half was still pending silently swallows its share
+    /// of the replies.
+    let requiredSubscriptionsBeforeConnected: [CBUUID] = [
+        CBUUID(string: YCBTUUIDs.command),
+        CBUUID(string: YCBTUUIDs.stream),
+    ]
+
+    /// Run ahead of the startup sequence, the moment both channels are up. See
+    /// `YCBTEncoder.postSubscriptionHandshake`.
+    func immediatePostSubscriptionCommands() -> [Data] {
+        encoder.postSubscriptionHandshake().map { Data($0) }
+    }
 
     // MARK: Framing
     func frame(_ command: Data) -> Data {
@@ -110,6 +162,7 @@ final class YCBTDriver: WearableDriver {
         // Commands the old link never got a reply for are owed nothing by the new one; leaving them
         // queued would pair the fresh connection's first `03 2f` reply with a dead command's mode.
         pendingMeasurementReplies.removeAll()
+        capabilities = profile.baselineCapabilities
     }
 
     /// Cancelling on the next *connect* is too late for the transfer: its stall watchdog is a timer, and
@@ -121,6 +174,7 @@ final class YCBTDriver: WearableDriver {
         assembler.reset()
         transfer.cancel()
         pendingMeasurementReplies.removeAll()
+        capabilities = profile.baselineCapabilities
     }
 
     // MARK: Inbound decode
@@ -151,7 +205,53 @@ final class YCBTDriver: WearableDriver {
                 events.append(contentsOf: decoder.decode(frame))
             }
         }
-        return events
+        updateCapabilities(from: events)
+        return events.filter(isSupported)
+    }
+
+    /// Fold the ring's own `02 01` reply into what we believe it has. Additive only, exactly as the
+    /// coordinator does for the UI-facing set — the bitmap can grant a gated capability, never revoke a
+    /// baseline one.
+    private func updateCapabilities(from events: [RingDecodedEvent]) {
+        for case let .supportFunctions(derived) in events {
+            capabilities = profile.refined(bitmapDerived: derived)
+        }
+    }
+
+    /// Drop samples for sensors this ring has not claimed.
+    ///
+    /// The UI already hides the *cards* for unclaimed metrics, so why also drop the data? Because the two
+    /// gates answer different questions. A hidden card still accumulates rows in the store, and those rows
+    /// outlive the gate: they sync to HealthKit, they feed the coach's summaries, and they reappear the
+    /// day the capability is granted — as history the ring never actually measured. The R99 session is the
+    /// precedent: a ring that denies a sensor four ways still emits *something* in that field, and
+    /// whatever it is, it is not a reading.
+    ///
+    /// Heart rate, SpO₂, respiratory rate and VO₂max are never filtered: no support-function bit names
+    /// them, so a gate here could only ever be a permanent deletion.
+    private func isSupported(_ event: RingDecodedEvent) -> Bool {
+        switch event {
+        case .bloodPressureSample: return capabilities.contains(.bloodPressure)
+        case .bloodSugarSample: return capabilities.contains(.bloodSugar)
+        case .hrvSample: return capabilities.contains(.hrv)
+        case .stressSample: return capabilities.contains(.stress)
+        case .fatigueSample: return capabilities.contains(.fatigue)
+        case .temperatureSample: return capabilities.contains(.temperature)
+        case let .historyMeasurement(kind, _, _): return isSupported(kind)
+        default: return true
+        }
+    }
+
+    private func isSupported(_ kind: MeasurementKind) -> Bool {
+        switch kind {
+        case .heartRate, .spo2, .respiratoryRate, .vo2max: return true
+        case .bloodPressureSystolic, .bloodPressureDiastolic: return capabilities.contains(.bloodPressure)
+        case .bloodSugar: return capabilities.contains(.bloodSugar)
+        case .hrv: return capabilities.contains(.hrv)
+        case .stress: return capabilities.contains(.stress)
+        case .fatigue: return capabilities.contains(.fatigue)
+        case .temperature: return capabilities.contains(.temperature)
+        }
     }
 
     /// The ring **retransmits an unacknowledged DevControl push** until the app answers `04 <key> {00}`,
@@ -172,6 +272,6 @@ final class YCBTDriver: WearableDriver {
     }
 
     func makeSyncEngine() -> RingSyncEngine {
-        YCBTSyncEngine(writer: writer, transfer: transfer)
+        YCBTSyncEngine(writer: writer, transfer: transfer, profile: profile)
     }
 }
