@@ -113,6 +113,7 @@ nav:
       - R10M / LittleMeatball: hardware/r10m.md
       - TK5 / SmartHealth: hardware/tk5.md
       - LuckRing / TK18: hardware/luckring.md
+      - RWfit rings: hardware/rwfit.md
       - SIMSONLAB: hardware/simsonlab.md
       - Premium Rings: hardware/premium.md
   - Platforms:

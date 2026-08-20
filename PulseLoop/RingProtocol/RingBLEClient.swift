@@ -1,6 +1,12 @@
 import Foundation
 @preconcurrency import CoreBluetooth
 
+enum RingLinkKeepaliveMode: Equatable {
+    case command
+    case gattBatteryRead
+    case none
+}
+
 /// Device-agnostic CoreBluetooth client for any supported wearable.
 ///
 /// The client owns only the CoreBluetooth plumbing — scanning, connecting, discovering
@@ -47,6 +53,17 @@ final class RingBLEClient: NSObject {
         ColmiCoordinator.self,
         LuckRingCoordinator.self,
         TK5Coordinator.self,
+        // The last two are the zero-risk slots: each matches only family-exclusive signals that no
+        // coordinator above claims, neither matches any name, and their signals are disjoint — so
+        // neither can shadow or be shadowed, and their order relative to each other is free.
+        //
+        // CRP matches the `fdda` service — which the CRP R11 doesn't even advertise pre-connect, so
+        // it never auto-claims at scan. It's reached by an explicit "Colmi R11 (Da Rings app)"
+        // carousel pick (`preferredFamily = .crp`), iOS having no post-connect re-route like Android's.
+        CRPCoordinator.self,
+        // Last is RWfit's documented slot, pinned by `testRWfitIsRegisteredLast`: the `A00A` service
+        // and company IDs `0x05D6`/`0x06D6`, no name matching at all.
+        RWfitCoordinator.self,
     ]
 
     /// Which coordinator serves a connection. Pure, so the pairing rules are testable without a
@@ -233,11 +250,20 @@ final class RingBLEClient: NSObject {
         beginConnect(
             to: target,
             deviceType: discoveredRing?.deviceType,
-            selectedModelID: discoveredRing?.wearableModelID ?? selectedModelID,
+            selectedModelID: Self.modelIDForConnect(
+                selectedModelID: selectedModelID,
+                scanInferredModelID: discoveredRing?.wearableModelID
+            ),
             advertisedName: discoveredRing?.name,
             preferredFamily: preferredFamily,
             userInitiated: true
         )
+    }
+
+    /// The carousel selection is an explicit user statement; scan inference is only its fallback.
+    /// This matters for the CRP R11, whose generic `SMART_RING` name is inferred as jring.
+    static func modelIDForConnect(selectedModelID: String?, scanInferredModelID: String?) -> String? {
+        selectedModelID ?? scanInferredModelID
     }
 
     /// Silently reconnect to the last paired ring (used on launch). Falls back to scanning.
@@ -510,17 +536,35 @@ final class RingBLEClient: NSObject {
     /// Record that the link just proved itself alive (notification / write ACK / read).
     private func noteActivity() { lastActivityAt = Date() }
 
-    /// Start the periodic keepalive ping. jring-only: Colmi runs its own keepalive inside its sync
-    /// engine, so pinging here would double up. The ring's ~20s idle timeout means a missed ping is
-    /// recoverable on the next tick.
+    /// The lightweight operation each family can use to prove an otherwise-idle GATT link is alive.
+    /// Kept pure/internal so the reliability policy is regression-testable without CoreBluetooth mocks.
+    static func keepaliveMode(for deviceType: RingDeviceType?) -> RingLinkKeepaliveMode {
+        switch deviceType {
+        case .jring: return .command
+        case .crp: return .gattBatteryRead
+        default: return .none
+        }
+    }
+
+    /// Start the periodic keepalive. jring needs its protocol ping; CRP exposes the standard GATT
+    /// battery characteristic, whose read callback proves the link is alive without competing for
+    /// CRP's scarce command/reply channel. Other families either self-drive or need no client ping.
     private func startKeepalive() {
         keepaliveTask?.cancel()
-        guard activeDeviceType == .jring else { return }
+        let mode = Self.keepaliveMode(for: activeDeviceType)
+        guard mode != .none else { return }
         keepaliveTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: self?.keepaliveInterval ?? 15_000_000_000)
                 guard let self, !Task.isCancelled, self.state == .connected else { return }
-                self.enqueueWrite(self.encoder.makeKeepaliveCommand())
+                switch mode {
+                case .command:
+                    self.enqueueWrite(self.encoder.makeKeepaliveCommand())
+                case .gattBatteryRead:
+                    self.readBattery()
+                case .none:
+                    return
+                }
             }
         }
     }
@@ -717,6 +761,7 @@ extension RingBLEClient: CBCentralManagerDelegate {
             // Auto-reconnect keeps the existing driver, so tell it the link is new: anything half-read
             // when the old link dropped (a partial frame, an in-flight history transfer) must go.
             activeDriver?.connectionDidStart()
+            activeSyncEngine?.connectionDidStart()
             // Discover ALL services so we also find a Device Information Service the ring exposes
             // without advertising it (firmware revision lives there). Characteristic discovery below
             // filters to the driver's chars + battery + firmware.
@@ -764,6 +809,7 @@ extension RingBLEClient: CBCentralManagerDelegate {
             // reconnect gap and refill the queue we just cleared, and those stale queries would be the
             // first thing the new link writes — ahead of its handshake.
             activeDriver?.connectionDidEnd()
+            activeSyncEngine?.connectionDidEnd()
             publish(.deviceStateChanged(state: .disconnected, address: nil))
             if autoReconnect {
                 state = .reconnecting
@@ -785,6 +831,9 @@ extension RingBLEClient: CBPeripheralDelegate {
     nonisolated func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         MainActor.assumeIsolated {
             guard let driver = activeDriver else { return }
+            // Full service list first, before any characteristic I/O: the RWfit driver picks its wire
+            // framing off which sibling services exist (see `WearableDriver.servicesDiscovered`).
+            driver.servicesDiscovered((peripheral.services ?? []).map(\.uuid))
             for service in peripheral.services ?? [] {
                 if driver.serviceUUIDs.contains(service.uuid) {
                     var chars = driver.notifyUUIDs

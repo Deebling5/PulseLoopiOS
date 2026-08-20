@@ -484,14 +484,22 @@ struct ConnectionStatusPill: View {
         .pulseGlass(Capsule(), interactive: true)
         .overlay(Capsule().stroke(PulseColors.borderSubtle, lineWidth: 1))
         .fixedSize(horizontal: true, vertical: false)
-        .onAppear {
-            guard isPulsing else { return }
-            withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) { pulse = true }
-        }
+        .onAppear { startPulse(isPulsing) }
+        // The pill stays mounted across state changes, so `onAppear` alone would miss a later
+        // idle → connecting flip — and would leave the repeatForever loop running after connect.
+        .onChange(of: isPulsing) { _, now in startPulse(now) }
     }
 
     private var isPulsing: Bool {
         state == .connecting || state == .reconnecting
+    }
+
+    /// Restart or cancel the dot pulse. The non-animated reset replaces the old repeatForever
+    /// transaction; without it the loop keeps animating the header for the app's whole lifetime.
+    private func startPulse(_ on: Bool) {
+        pulse = false
+        guard on else { return }
+        withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) { pulse = true }
     }
 
     private var dotColor: Color {

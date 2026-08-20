@@ -311,6 +311,9 @@ struct MeasurementSheet: View {
         guard ble.state == .connected else {
             return "Your ring isn't connected. Reconnect it and try again."
         }
+        // The ring told us it wasn't on the finger, so the generic "keep still" advice would send the
+        // user to fix the wrong thing — an optical sensor with no skin contact cannot read at all.
+        if coordinator.measureNotWorn { return kind.notWornMessage }
         return kind.failureMessage
     }
 

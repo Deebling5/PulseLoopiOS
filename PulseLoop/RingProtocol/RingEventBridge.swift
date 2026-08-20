@@ -114,6 +114,11 @@ enum RingEventBridge {
             guard (0...100).contains(percent) else { return [] }
             return [.batteryLevel(percent: percent)]
 
+        case let .wearingStatus(worn, _):
+            // Fanned out unconditionally; `RingSyncCoordinator` is what gates on family, because only
+            // CRP's polarity is hardware-confirmed (see `RingDecodedEvent.wearingStatus`).
+            return [.wearState(worn: worn)]
+
         case let .status(address):
             // The status reply carries the ring's embedded address; surface it (and refresh
             // last-sync) by re-asserting the connected state with the address attached.
