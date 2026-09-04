@@ -106,6 +106,7 @@ nav:
       - iOS: getting-started/ios.md
       - Sideloading the IPA: getting-started/sideloading.md
       - Android: getting-started/android.md
+      - Local / self-hosted AI Coach: local-llm-coach.md
   - Hardware:
       - Overview: hardware/index.md
       - Jring / 56ff: hardware/jring.md
